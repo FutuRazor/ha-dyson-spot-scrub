@@ -250,6 +250,11 @@ async def get_live_map(token: str, serial: str) -> dict[str, Any]:
     headers = {**_HEADERS, "Authorization": f"Bearer {token}"}
     async with aiohttp.ClientSession(connector=_connector()) as session:
         async with session.get(url, headers=headers) as resp:
+            if resp.status == 429:
+                retry_after = resp.headers.get("Retry-After", "30")
+                raise DysonApiError(
+                    f"Live map fetch failed (HTTP 429 Retry-After {retry_after})"
+                )
             data = await _json(resp)
             if resp.status == 200 and isinstance(data, dict):
                 return data

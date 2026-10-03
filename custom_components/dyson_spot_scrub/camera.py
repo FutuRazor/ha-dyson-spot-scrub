@@ -28,7 +28,7 @@ from homeassistant.helpers.storage import Store
 
 from .const import DOMAIN, CONF_SERIAL, CONF_DEVICE_NAME, CONF_PRODUCT_TYPE, CONF_AUTH_TOKEN
 from .coordinator import DysonCoordinator
-from .dyson_api import get_current_map, get_map_metadata, get_live_map, DysonApiError
+from .dyson_api import get_current_map, get_map_metadata, DysonApiError
 from .dyson_mqtt import is_any_cleaning
 from .map_renderer import render_map
 
@@ -159,12 +159,18 @@ class DysonMapCamera(Camera):
 
         # ── Fetch live data if cleaning ───────────────────────────────────────
         live_data: dict[str, Any] | None = None
-        if (
+        cleaning = (
             self._coordinator.mqtt is not None
             and self._coordinator.mqtt.connected
             and is_any_cleaning(self._coordinator.mqtt.state)
-        ):
-            live_data = await self._async_fetch_live()
+        )
+        if cleaning:
+            live_data = await self._coordinator.async_get_live_map()
+
+        # If cleaning but the fetch failed (rate-limited or transient error),
+        # return the last known good frame rather than rendering a pathless image.
+        if cleaning and live_data is None and self._last_image is not None:
+            return self._last_image
 
         # ── Update presentation cache from fresh zone data ────────────────────
         # Prefer live_data (most up-to-date), fall back to static map.
@@ -267,13 +273,3 @@ class DysonMapCamera(Camera):
                 self._serial, exc,
             )
 
-    async def _async_fetch_live(self) -> dict[str, Any] | None:
-        """Fetch the live cleaning map; returns None if unavailable/error."""
-        try:
-            return await get_live_map(self._token, self._serial)
-        except DysonApiError:
-            # Robot may have just finished cleaning; not an error
-            return None
-        except Exception as exc:  # pylint: disable=broad-except
-            _LOGGER.debug("[%s] Live map fetch failed: %s", self._serial, exc)
-            return None

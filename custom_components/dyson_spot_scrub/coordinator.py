@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -11,18 +12,20 @@ from homeassistant.core import HomeAssistant, callback
 from .const import (
     CONF_SERIAL,
     CONF_MQTT_PREFIX,
-    CONF_ROBOT_HOST,
-    CONF_LOCAL_MQTT_USERNAME,
-    CONF_LOCAL_MQTT_PASSWORD,
+    CONF_AUTH_TOKEN,
     DEFAULT_MODE,
     CONF_CACHED_ROOMS,
 )
+from .dyson_api import get_iot_credentials, get_live_map, DysonApiError
 from .dyson_mqtt import DysonMqttClient
 
 _LOGGER = logging.getLogger(__name__)
 
 # Reconnect backoff schedule (seconds): 15 s, 30 s, 60 s, then 120 s forever
 _RECONNECT_DELAYS = [15, 30, 60, 120]
+
+# Minimum seconds between upstream live-map API calls (shared across all viewers)
+_LIVE_MAP_MIN_INTERVAL = 5.0
 
 
 class DysonCoordinator:
@@ -38,16 +41,11 @@ class DysonCoordinator:
         verbose: bool = False,
     ) -> None:
         self.hass          = hass
-        self._token        = token   # retained for future API calls (map, OTA, etc.)
+        self._token        = token
         self.serial        = serial
         self._prefix       = mqtt_prefix
         self._config_entry = config_entry
         self._verbose      = verbose
-
-        # Local MQTT credentials — stored in config entry during setup wizard
-        self._robot_host    = config_entry.data.get(CONF_ROBOT_HOST, "")
-        self._mqtt_username = config_entry.data.get(CONF_LOCAL_MQTT_USERNAME, "")
-        self._mqtt_password = config_entry.data.get(CONF_LOCAL_MQTT_PASSWORD, "")
 
         self.mqtt: DysonMqttClient | None = None
 
@@ -72,30 +70,29 @@ class DysonCoordinator:
         self._reconnect_task: asyncio.Task | None = None
         self._reconnect_attempt: int = 0
 
+        # Live-map fetch: shared across all camera viewers (deduplication + 429 backoff)
+        self._live_map_cache: dict | None = None
+        self._live_map_fetched_at: float = 0.0
+        self._live_map_backoff_until: float = 0.0
+        self._live_map_lock: asyncio.Lock = asyncio.Lock()
+
     # ── Setup / teardown ──────────────────────────────────────────────────────
 
     async def async_setup(self) -> None:
-        """Open the local MQTT connection.
+        """Open the cloud MQTT connection.
 
-        Connects directly to the robot's onboard broker — no cloud calls needed.
+        Fetches fresh IoT credentials from Dyson's API and connects to the
+        AWS IoT Core broker over WebSocket (port 443).
 
-        On failure (robot offline, wrong IP) the error is logged but NOT re-raised
-        so the config entry still loads and entities are created.  They show as
-        unavailable until a background reconnect succeeds.
+        On failure the error is logged but NOT re-raised so the config entry
+        still loads and entities are created.  They show as unavailable until
+        a background reconnect succeeds.
         """
         self._shutting_down = False
         self._reconnect_attempt = 0
 
-        if not self._robot_host:
-            _LOGGER.error(
-                "[%s] No robot_host configured — reconfigure this integration "
-                "to enter the robot's local IP address",
-                self.serial,
-            )
-            return
-
         try:
-            await self._async_connect_local()
+            await self._async_connect_cloud()
         except Exception as exc:
             _LOGGER.warning(
                 "[%s] Initial MQTT connection failed (%s) — "
@@ -108,14 +105,19 @@ class DysonCoordinator:
                     self._async_reconnect()
                 )
 
-    async def _async_connect_local(self) -> None:
-        """Build a fresh DysonMqttClient and connect to the local broker."""
+    async def _async_connect_cloud(self) -> None:
+        """Fetch fresh IoT credentials and connect to the cloud MQTT broker."""
+        _LOGGER.debug("[%s] Fetching IoT credentials from Dyson API", self.serial)
+        iot = await get_iot_credentials(self._token, self.serial)
+
         new_client = DysonMqttClient(
             serial=self.serial,
             mqtt_prefix=self._prefix,
-            robot_host=self._robot_host,
-            mqtt_username=self._mqtt_username,
-            mqtt_password=self._mqtt_password,
+            endpoint=iot["endpoint"],
+            token_value=iot["token_value"],
+            token_signature=iot["token_signature"],
+            client_id=iot["client_id"],
+            authorizer_name=iot["authorizer_name"],
             verbose=self._verbose,
         )
         new_client.on_connected      = self._on_mqtt_connected
@@ -140,17 +142,18 @@ class DysonCoordinator:
     # ── Reconnect logic ───────────────────────────────────────────────────────
 
     async def _async_reconnect(self) -> None:
-        """Reconnect to the local MQTT broker, with backoff.
+        """Reconnect to Dyson's cloud MQTT broker, with backoff.
 
-        No cloud calls needed — credentials are stored locally in the config entry.
+        Fetches fresh IoT credentials on each attempt — the tokens expire
+        so they must not be cached across reconnects.
         """
         delay = _RECONNECT_DELAYS[
             min(self._reconnect_attempt, len(_RECONNECT_DELAYS) - 1)
         ]
         self._reconnect_attempt += 1
         _LOGGER.info(
-            "[%s] Reconnect attempt %d — waiting %d s before retrying %s:1883",
-            self.serial, self._reconnect_attempt, delay, self._robot_host,
+            "[%s] Reconnect attempt %d — waiting %d s before retrying",
+            self.serial, self._reconnect_attempt, delay,
         )
         await asyncio.sleep(delay)
 
@@ -167,12 +170,12 @@ class DysonCoordinator:
                 pass
 
         try:
-            await self._async_connect_local()
+            await self._async_connect_cloud()
             self._reconnect_attempt = 0  # Reset backoff on success
-            _LOGGER.info("[%s] Reconnected to local broker successfully", self.serial)
+            _LOGGER.info("[%s] Reconnected to cloud broker successfully", self.serial)
         except Exception:
             _LOGGER.exception(
-                "[%s] Reconnect connect() failed — scheduling retry", self.serial
+                "[%s] Reconnect failed — scheduling retry", self.serial
             )
             if not self._shutting_down:
                 self._reconnect_task = self.hass.async_create_task(
@@ -187,6 +190,75 @@ class DysonCoordinator:
 
     def async_remove_listener(self, listener: Any) -> None:
         self._listeners = [l for l in self._listeners if l is not listener]
+
+    # ── Live-map fetch (shared across camera viewers) ─────────────────────────
+
+    async def async_get_live_map(self) -> dict | None:
+        """Fetch the live cleaning map, shared across all viewers.
+
+        Returns cached data if it is still fresh (within _LIVE_MAP_MIN_INTERVAL).
+        Returns None — without touching the cache — when inside a 429 back-off
+        window or when the upstream request fails.  Callers should keep their
+        previous good frame when None is returned during an active cleaning run.
+
+        At most one coroutine fetches at a time; others wait and share the result.
+        """
+        now = time.monotonic()
+
+        # Inside 429 back-off — don't attempt a new request
+        if now < self._live_map_backoff_until:
+            _LOGGER.debug(
+                "[%s] Live-map: 429 back-off %.0f s remaining",
+                self.serial,
+                self._live_map_backoff_until - now,
+            )
+            return None
+
+        # Return cached data if it is fresh enough (skip the lock — fast path)
+        if (
+            self._live_map_cache is not None
+            and (now - self._live_map_fetched_at) < _LIVE_MAP_MIN_INTERVAL
+        ):
+            return self._live_map_cache
+
+        # One coroutine fetches at a time; the rest wait and share the result
+        async with self._live_map_lock:
+            # Re-check after acquiring — a previous waiter may have already fetched
+            now = time.monotonic()
+            if now < self._live_map_backoff_until:
+                return None
+            if (
+                self._live_map_cache is not None
+                and (now - self._live_map_fetched_at) < _LIVE_MAP_MIN_INTERVAL
+            ):
+                return self._live_map_cache
+
+            try:
+                data = await get_live_map(self._token, self.serial)
+                self._live_map_cache = data
+                self._live_map_fetched_at = time.monotonic()
+                return data
+            except DysonApiError as exc:
+                raw = str(exc)
+                if "429" in raw:
+                    # Parse the Retry-After value embedded by get_live_map()
+                    retry_after = 30.0
+                    for part in raw.split():
+                        try:
+                            retry_after = max(5.0, float(part))
+                            break
+                        except ValueError:
+                            pass
+                    self._live_map_backoff_until = time.monotonic() + retry_after
+                    _LOGGER.warning(
+                        "[%s] Live-map HTTP 429 — backing off %.0f s",
+                        self.serial,
+                        retry_after,
+                    )
+                else:
+                    _LOGGER.debug("[%s] Live-map fetch failed: %s", self.serial, exc)
+                # Return None so callers keep their last-good frame
+                return None
 
     # ── Internal callbacks (called from paho thread) ──────────────────────────
 
@@ -225,7 +297,6 @@ class DysonCoordinator:
         """Runs on the HA event loop after an unexpected disconnect."""
         self._async_notify_listeners()
         if not self._shutting_down:
-            # Only schedule a new reconnect task if one isn't already pending
             if self._reconnect_task is None or self._reconnect_task.done():
                 self._reconnect_task = self.hass.async_create_task(
                     self._async_reconnect()
@@ -238,7 +309,6 @@ class DysonCoordinator:
             new_rooms = self.mqtt.room_names
             if new_rooms and set(new_rooms) != set(self.cached_room_names):
                 self.cached_room_names = list(new_rooms)
-                # Persist to config entry so they survive HA restarts
                 self.hass.config_entries.async_update_entry(
                     self._config_entry,
                     data={**self._config_entry.data, CONF_CACHED_ROOMS: new_rooms},
@@ -293,7 +363,6 @@ class DysonCoordinator:
             elif cleaning_started and (is_docked(state) or is_charging(state)):
                 done_event.set()
 
-        # Hook into state changes while waiting
         class _Watcher:
             def async_write_ha_state(inner_self) -> None:
                 loop.call_soon_threadsafe(_check)
