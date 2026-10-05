@@ -1,7 +1,7 @@
-"""Dyson local MQTT client — connection, commands, state parsing.
+"""Dyson cloud MQTT client — connection, commands, state parsing.
 
 Connects to Dyson's AWS IoT Core broker over WebSocket (port 443) using a
-custom authorizer. No certificates required — authentication is via signed
+custom authorizer.  No certificates required — authentication is via signed
 token values from the IoT credentials endpoint.
 
 WebSocket URL:
@@ -23,6 +23,7 @@ import logging
 import math
 import random
 import re
+import ssl
 import threading
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -163,6 +164,7 @@ def _room_display_name(raw_name: Any) -> str:
 class DysonMqttClient:
     """Thread-safe paho-mqtt wrapper for the Dyson robot.
 
+    Connects to Dyson's AWS IoT Core broker over WebSocket (port 443).
     Callbacks (on_state_change, on_connected, on_disconnected) are called
     from the paho network thread. Bridge to asyncio with
     hass.loop.call_soon_threadsafe() in the coordinator.
@@ -172,17 +174,21 @@ class DysonMqttClient:
         self,
         serial: str,
         mqtt_prefix: str,
-        robot_host: str,
-        mqtt_username: str,
-        mqtt_password: str,
+        endpoint: str,
+        token_value: str,
+        token_signature: str,
+        client_id: str,
+        authorizer_name: str,
         verbose: bool = False,
     ) -> None:
-        self.serial          = serial
-        self._prefix         = mqtt_prefix
-        self._robot_host     = robot_host
-        self._mqtt_username  = mqtt_username
-        self._mqtt_password  = mqtt_password
-        self._verbose        = verbose
+        self.serial            = serial
+        self._prefix           = mqtt_prefix
+        self._endpoint         = endpoint
+        self._token_value      = token_value
+        self._token_signature  = token_signature
+        self._client_id        = client_id
+        self._authorizer_name  = authorizer_name
+        self._verbose          = verbose
 
         self._client:    mqtt.Client | None = None
         self._lock       = threading.Lock()
@@ -235,41 +241,49 @@ class DysonMqttClient:
         self._state_callbacks = [c for c in self._state_callbacks if c is not cb]
 
     def connect(self) -> None:
-        """Connect to the robot's local MQTT broker (blocking). Call from executor.
+        """Connect to Dyson's AWS IoT Core broker over WebSocket (blocking).
 
-        Uses plain TCP on port 1883 with username/password authentication.
-        No TLS, no cloud — the robot's onboard broker handles everything locally.
+        Uses paho's websockets transport on port 443 with TLS.  Authentication
+        is handled by AWS's custom authorizer — no client certificates needed.
 
         reconnect_on_failure=False: the coordinator manages all reconnects.
         paho's built-in retry would reuse the same ClientId and cause the broker
         to kick us off (rc=7), creating a rapid-fire disconnect cascade.
         """
+        ws_path = (
+            f"/mqtt"
+            f"?x-amz-customauthorizer-name={self._authorizer_name}"
+            f"&token={self._token_value}"
+            f"&x-amz-customauthorizer-signature={quote(self._token_signature, safe='')}"
+        )
+
         try:
             client = mqtt.Client(
                 callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
-                client_id=f"ha-dyson-{self.serial}",
-                transport="tcp",
+                client_id=self._client_id,
+                transport="websockets",
                 protocol=mqtt.MQTTv311,
                 reconnect_on_failure=False,
             )
         except AttributeError:
             # paho-mqtt 1.x — no CallbackAPIVersion or reconnect_on_failure
             client = mqtt.Client(
-                client_id=f"ha-dyson-{self.serial}",
-                transport="tcp",
+                client_id=self._client_id,
+                transport="websockets",
                 protocol=mqtt.MQTTv311,
             )
 
-        client.username_pw_set(self._mqtt_username, self._mqtt_password)
+        client.ws_set_options(path=ws_path)
+        client.tls_set_context(ssl.create_default_context())
         client.on_connect    = self._on_connect
         client.on_disconnect = self._on_disconnect
         client.on_message    = self._on_message
 
         _LOGGER.debug(
-            "[%s] Connecting to local MQTT broker at %s:1883",
-            self.serial, self._robot_host,
+            "[%s] Connecting to Dyson cloud MQTT at %s:443",
+            self.serial, self._endpoint,
         )
-        client.connect(self._robot_host, port=1883, keepalive=30)
+        client.connect(self._endpoint, port=443, keepalive=30)
 
         with self._lock:
             self._client = client
@@ -322,9 +336,6 @@ class DysonMqttClient:
                     self.serial, self._start_retry_count,
                 )
                 self._cancel_start_retry()
-                # Basic global start — no room_ids so the robot cleans everything.
-                # Do NOT send service.set_room_clean with room_ids=[] here; an
-                # empty room list is rejected by the robot and prevents cleaning.
                 self._publish({
                     "msg":          "START",
                     "mode-reason":  "RAPP",
@@ -350,14 +361,20 @@ class DysonMqttClient:
         room_ids = [r[0] for r in pref["room"]]
         zone_ids = [str(r) for r in room_ids]
 
-        # Set preference mode (index 3) for every room
+        # Build 12-element preference arrays for every room.
+        # Index mapping confirmed from live data (Sep 2026):
+        #   [4]  = clean type (mode): 0=Vacuum+Wash, 2=Vacuum only
+        #   [8]  = enabled flag (1=yes)
+        #   [10] = 1-based sequence order
         updated_rooms = []
-        for room in pref["room"]:
-            r = list(room)[:11]
-            while len(r) < 11:
+        for i, room in enumerate(pref["room"]):
+            r = list(room)
+            while len(r) < 12:
                 r.append(0)
-            r[3] = mode
-            updated_rooms.append(r)
+            r[4]  = mode   # clean type at confirmed index [4]
+            r[8]  = 1      # all rooms enabled for global clean
+            r[10] = i + 1  # 1-based order
+            updated_rooms.append(r[:12])
 
         self._publish_jdm("service.set_preference", {
             "map_id":          map_id,
@@ -423,7 +440,7 @@ class DysonMqttClient:
         mode: 0=Vacuum only, 1=Vacuum+Mop, 2=Mop only, 3=Vacuum then Mop.
 
         Sends the same 4-command JDM sequence the Dyson app uses:
-          1. service.set_preference  — 11-element arrays; only the target room
+          1. service.set_preference  — 12-element arrays; only the target room
                                        has index[8]=1 (enabled).
           2. START                   — cleaningMode "zoneConfigured" with only
                                        the target room in unorderedZones.
@@ -534,19 +551,16 @@ class DysonMqttClient:
             _LOGGER.error("[%s] MQTT connect failed, rc=%s", self.serial, rc)
             return
         _LOGGER.info(
-            "[%s] MQTT connected — broker=%s prefix=%s",
-            self.serial, self._robot_host, self._prefix,
+            "[%s] MQTT connected — endpoint=%s prefix=%s",
+            self.serial, self._endpoint, self._prefix,
         )
         self.connected = True
         self._preferences_fetched = False  # Allow re-fetch on reconnect
         # Single wildcard subscription covers every prefix (RB05, NROB, …).
-        # A second subscription on the specific prefix would cause each inbound
-        # message to fire _on_message twice — once per matching subscription.
         client.subscribe(f"+/{self.serial}/#", qos=0)
         self.request_current_state()
         # Probe map IDs 0-3 at staggered intervals so rooms populate even
         # when the robot omits persistentMapId from its idle CURRENT-STATE.
-        # Each probe is skipped if a previous one already succeeded.
         for _mid in range(4):
             delay = _mid * 2.5  # 0 s, 2.5 s, 5 s, 7.5 s
             if delay == 0:
@@ -557,11 +571,6 @@ class DysonMqttClient:
             self.on_connected()
 
     def _on_disconnect(self, client, userdata, rc) -> None:
-        # Guard: only propagate the first disconnect event per client instance.
-        # With paho's auto-reconnect, _on_disconnect may fire multiple times
-        # (once per failed retry attempt), each with a different rc. Without this
-        # guard, each firing would trigger a new coordinator reconnect task,
-        # creating more clients and amplifying the cascade.
         if self._disconnected_handled:
             _LOGGER.debug(
                 "[%s] Ignoring repeated disconnect callback (rc=%s)", self.serial, rc
@@ -582,10 +591,6 @@ class DysonMqttClient:
         topic = msg.topic
 
         # Auto-detect the real MQTT prefix from inbound robot messages.
-        # The stored prefix may differ from what the robot actually uses
-        # (e.g. config stored "NROB" but robot publishes on "RB05").
-        # Adopt the real prefix immediately so all subsequent command
-        # publishes reach the robot on the correct topic.
         parts = topic.split("/")
         if (
             len(parts) >= 2
@@ -599,10 +604,6 @@ class DysonMqttClient:
             self._prefix = parts[0]
             if self.on_prefix_changed:
                 self.on_prefix_changed(parts[0])
-            # The initial requests (current-state, get_preference) were sent
-            # to the wrong prefix and were silently dropped.  Re-send them
-            # now on the correct prefix so the room preferences are cached
-            # before the user presses Start.
             self.request_current_state()
             self._preferences_fetched = False
             for _mid in range(4):
@@ -629,20 +630,15 @@ class DysonMqttClient:
         elif method == "prop.get" and data.get("data"):
             self._merge_jdm_props(data["data"])
         elif method == "service.get_preference" and data.get("data"):
-            # Accept the response regardless of the code field — some firmware
-            # variants omit it or use non-zero codes for partial success.
             pref = data["data"]
             n = len(pref.get("room", []))
             if n == 0:
-                # Probe returned nothing (wrong map_id or empty map) — skip so
-                # we don't blank out a previously valid cache.
                 _LOGGER.debug("[%s] get_preference: 0 rooms (map probe)", self.serial)
                 return
             first_cache = self._cached_preference is None
             self._cached_preference = pref
             if first_cache:
                 _LOGGER.info("[%s] Room preferences cached (%d room(s))", self.serial, n)
-                # Notify HA entities so the room dropdown populates immediately.
                 self._notify_state_change()
             else:
                 _LOGGER.debug("[%s] Room preferences refreshed (%d room(s))", self.serial, n)
@@ -653,7 +649,6 @@ class DysonMqttClient:
             self.state = {**self.state, **data}
             self._notify_state_change()
 
-            # Fetch room preferences once we have the map ID
             if not self._preferences_fetched and self.state.get("persistentMapId"):
                 self._preferences_fetched = True
                 self._fetch_room_preferences()
@@ -688,7 +683,7 @@ class DysonMqttClient:
     def _probe_map_id(self, map_id: int) -> None:
         """Send service.get_preference for one map_id — skip if already have rooms."""
         if self._cached_preference and self._cached_preference.get("room"):
-            return  # Already populated — nothing to do
+            return
         _LOGGER.debug("[%s] Probing map_id=%d for room preferences", self.serial, map_id)
         self._publish_raw(self._jdm_command_topic, {
             "msgId":   _rand_msg_id(),
