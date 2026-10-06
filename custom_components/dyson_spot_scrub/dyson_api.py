@@ -29,7 +29,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import ssl
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import urlencode
 
@@ -66,7 +69,31 @@ class DysonApiError(Exception):
     """Raised when a Dyson API call fails."""
 
 
+class DysonRateLimitError(DysonApiError):
+    """Raised for HTTP 429, with a retry delay independent of the message."""
+
+    def __init__(self, message: str, retry_after: float) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _parse_retry_after(value: str | None) -> float:
+    """Parse Retry-After seconds or an HTTP date; default to 30 seconds."""
+    if value is not None:
+        value = value.strip()
+        try:
+            if value.isascii() and value.isdecimal():
+                seconds = float(value)
+                return seconds if math.isfinite(seconds) else 30.0
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is not None:
+                return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return 30.0
 
 
 def _connector() -> aiohttp.TCPConnector:
@@ -251,9 +278,10 @@ async def get_live_map(token: str, serial: str) -> dict[str, Any]:
     async with aiohttp.ClientSession(connector=_connector()) as session:
         async with session.get(url, headers=headers) as resp:
             if resp.status == 429:
-                retry_after = resp.headers.get("Retry-After", "30")
-                raise DysonApiError(
-                    f"Live map fetch failed (HTTP 429 Retry-After {retry_after})"
+                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                raise DysonRateLimitError(
+                    f"Live map fetch failed (HTTP 429 Retry-After {retry_after:g})",
+                    retry_after=retry_after,
                 )
             data = await _json(resp)
             if resp.status == 200 and isinstance(data, dict):

@@ -16,7 +16,12 @@ from .const import (
     DEFAULT_MODE,
     CONF_CACHED_ROOMS,
 )
-from .dyson_api import get_iot_credentials, get_live_map, DysonApiError
+from .dyson_api import (
+    DysonApiError,
+    DysonRateLimitError,
+    get_iot_credentials,
+    get_live_map,
+)
 from .dyson_mqtt import DysonMqttClient
 
 _LOGGER = logging.getLogger(__name__)
@@ -239,16 +244,8 @@ class DysonCoordinator:
                 self._live_map_fetched_at = time.monotonic()
                 return data
             except DysonApiError as exc:
-                raw = str(exc)
-                if "429" in raw:
-                    # Parse the Retry-After value embedded by get_live_map()
-                    retry_after = 30.0
-                    for part in raw.split():
-                        try:
-                            retry_after = max(5.0, float(part))
-                            break
-                        except ValueError:
-                            pass
+                if isinstance(exc, DysonRateLimitError):
+                    retry_after = max(5.0, exc.retry_after)
                     self._live_map_backoff_until = time.monotonic() + retry_after
                     _LOGGER.warning(
                         "[%s] Live-map HTTP 429 — backing off %.0f s",
