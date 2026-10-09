@@ -52,12 +52,6 @@ _HEADERS = {
     "X-Dyson-LinkApp-Version": "6.4.26340",
 }
 
-# SSL context that skips verification (Dyson's cert chain fails on some platforms)
-_SSL_CONTEXT = ssl.create_default_context()
-_SSL_CONTEXT.check_hostname = False
-_SSL_CONTEXT.verify_mode = ssl.CERT_NONE
-
-
 # ── Exceptions ────────────────────────────────────────────────────────────────
 
 
@@ -97,7 +91,7 @@ def _parse_retry_after(value: str | None) -> float:
 
 
 def _connector() -> aiohttp.TCPConnector:
-    return aiohttp.TCPConnector(ssl=_SSL_CONTEXT)
+    return aiohttp.TCPConnector(ssl=True)
 
 
 async def _json(resp: aiohttp.ClientResponse) -> Any:
