@@ -317,6 +317,20 @@ class DysonMqttClient:
             self._start_cancelled = True
             self._preference_ready.set()
 
+    def _abort_dock_action(self) -> None:
+        """Send ABORT-DOCK-ACTION before every clean start.
+
+        The Dyson app sends this command (with action=DRY_MOP) before starting
+        any clean cycle.  It kills any active drying cycle so the robot does
+        not try to do two things at once.  Confirmed from MQTT captures Oct 2026.
+        """
+        self._publish({
+            "msg":         "ABORT-DOCK-ACTION",
+            "action":      "DRY_MOP",
+            "mode-reason": "RAPP",
+            "time":        _now_iso(),
+        })
+
     def stop(self) -> None:
         with self._preference_lock:
             self._cancel_pending_start()
@@ -440,6 +454,7 @@ class DysonMqttClient:
                     "room_preference": updated_rooms,
                     "uv_switch": deepcopy(pref.get("uv_switch", [])),
                 })
+                self._abort_dock_action()
                 self._publish({
                     "msg": "START",
                     "mode-reason": "RAPP",
