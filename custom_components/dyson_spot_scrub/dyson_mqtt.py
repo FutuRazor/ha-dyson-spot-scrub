@@ -521,6 +521,13 @@ class DysonMqttClient:
         except (json.JSONDecodeError, UnicodeDecodeError):
             return
 
+        if not isinstance(data, dict):
+            _LOGGER.debug(
+                "[%s] Ignoring non-object MQTT payload on %s: %r",
+                self.serial, msg.topic, type(data).__name__,
+            )
+            return
+
         topic = msg.topic
 
         # Auto-detect the real MQTT prefix from inbound robot messages.
