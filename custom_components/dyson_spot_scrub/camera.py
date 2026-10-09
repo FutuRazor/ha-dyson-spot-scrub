@@ -11,6 +11,9 @@ hammered on every fast-poll tick.
 
 Zone presentation data (perimeter segments) is persisted to HA storage
 so room outlines survive restarts without needing a new cleaning run.
+
+The last cleaning image is kept in RAM during pauses and mode transitions,
+and for five minutes after completion or cancellation. A new cleaning clears it.
 """
 from __future__ import annotations
 
@@ -29,7 +32,7 @@ from homeassistant.helpers.storage import Store
 from .const import DOMAIN, CONF_SERIAL, CONF_DEVICE_NAME, CONF_PRODUCT_TYPE, CONF_AUTH_TOKEN
 from .coordinator import DysonCoordinator
 from .dyson_api import get_current_map, get_map_metadata, DysonApiError
-from .dyson_mqtt import is_any_cleaning
+from .dyson_mqtt import RUNNING_STATES, is_any_cleaning
 from .map_renderer import render_map
 
 _LOGGER = logging.getLogger(__name__)
@@ -43,6 +46,18 @@ _STATIC_CACHE_TTL  = 3600   # 1 hour
 
 # HA storage for zone presentation persistence
 _STORE_VERSION = 1
+
+_RETENTION_SECONDS = 5 * 60
+
+
+class _CleaningStateListener:
+    """Observe coordinator notifications even when nobody is viewing the camera."""
+
+    def __init__(self, camera: DysonMapCamera) -> None:
+        self._camera = camera
+
+    def async_write_ha_state(self) -> None:
+        self._camera._observe_cleaning_state()
 
 
 async def async_setup_entry(
@@ -108,12 +123,91 @@ class DysonMapCamera(Camera):
 
         # Last rendered image (returned on error / while fetching)
         self._last_image:  bytes | None = None
+        self._last_cleaning_image: bytes | None = None
+        self._cleaning_active = False
+        self._cleaning_finished_at: float | None = None
+        self._cleaning_generation = 0
+        self._map_id: str | None = None
+        self._image_lock = asyncio.Lock()
+        self._cleaning_listener = _CleaningStateListener(self)
+
+    @property
+    def _retention_seconds(self) -> float:
+        """Retention policy; a later options flow can supply this duration."""
+        return _RETENTION_SECONDS
+
+    def _reset_cleaning_image(self, reason: str) -> None:
+        self._cleaning_generation += 1
+        self._last_cleaning_image = None
+        self._last_image = None
+        self._cleaning_finished_at = None
+        _LOGGER.debug("[%s] Cleaning image reset: %s", self._serial, reason)
+
+    def _observe_cleaning_state(self) -> None:
+        mqtt = self._coordinator.mqtt
+        if mqtt is None or not mqtt.connected:
+            return  # A disconnect is not the end of a cleaning.
+        state = dict(mqtt.state)
+        map_id = state.get("persistentMapId")
+        if map_id is not None:
+            map_id = str(map_id)
+            if self._map_id is not None and map_id != self._map_id:
+                self._reset_cleaning_image("map changed")
+                self._cleaning_active = False
+                self._map_data = None
+                self._metadata = None
+                self._presentation_cache = {}
+                self._coordinator.async_clear_live_map_cache()
+            self._map_id = map_id
+
+        status = state.get("state")
+        if status in ("FULL_CLEAN_FINISHED", "ABORTED"):
+            if self._cleaning_active:
+                self._cleaning_active = False
+                self._cleaning_finished_at = time.monotonic()
+                _LOGGER.debug(
+                    "[%s] Cleaning image retention started: %s, duration=%s s",
+                    self._serial, status, self._retention_seconds,
+                )
+        elif status in RUNNING_STATES and status != "FULL_CLEAN_PAUSED":
+            if not self._cleaning_active:
+                self._reset_cleaning_image("new cleaning")
+                self._coordinator.async_clear_live_map_cache()
+                self._cleaning_active = True
+
+    def _fetch_live_map(self) -> bool:
+        mqtt = self._coordinator.mqtt
+        if mqtt is None or not mqtt.connected:
+            return False
+        state = dict(mqtt.state)
+        return (
+            is_any_cleaning(state)
+            and state.get("state") != "FULL_CLEAN_PAUSED"
+            and state.get("fullCleanAction") != "NONE"
+        )
+
+    def _retained_image(self) -> bytes | None:
+        if self._cleaning_finished_at is not None:
+            if time.monotonic() - self._cleaning_finished_at >= self._retention_seconds:
+                self._reset_cleaning_image("retention expired")
+                return None
+            return self._last_cleaning_image
+        if self._cleaning_active and not self._fetch_live_map():
+            # Pausing, mop washing, mode transitions and disconnects do not
+            # complete a job. Do not start the retention timer in these states.
+            return self._last_cleaning_image
+        return None
 
     # ── HA lifecycle ──────────────────────────────────────────────────────────
 
     async def async_added_to_hass(self) -> None:
         """Called when the entity is added — load persisted presentation cache."""
         await super().async_added_to_hass()
+        self._coordinator.async_add_listener(self._cleaning_listener)
+        self.async_on_remove(
+            lambda: self._coordinator.async_remove_listener(self._cleaning_listener)
+        )
+        self._observe_cleaning_state()
         self._store = Store(self.hass, _STORE_VERSION, self._store_key)
         data = await self._store.async_load()
         if data and isinstance(data, dict):
@@ -123,6 +217,11 @@ class DysonMapCamera(Camera):
                 self._serial, len(data),
             )
 
+    async def async_will_remove_from_hass(self) -> None:
+        self._reset_cleaning_image("entity unloaded")
+        self._cleaning_active = False
+        await super().async_will_remove_from_hass()
+
     @property
     def available(self) -> bool:
         """Camera is always available; it shows the last known map on errors."""
@@ -131,6 +230,8 @@ class DysonMapCamera(Camera):
     @property
     def frame_interval(self) -> float:
         """Seconds between automatic image refreshes."""
+        if self._cleaning_active or self._cleaning_finished_at is not None:
+            return _CLEANING_INTERVAL
         if (
             self._coordinator.mqtt is not None
             and self._coordinator.mqtt.connected
@@ -147,11 +248,23 @@ class DysonMapCamera(Camera):
         height: int | None = None,
     ) -> bytes | None:
         """Fetch map data and render a PNG; return cached image on errors."""
+        async with self._image_lock:
+            return await self._async_camera_image()
+
+    async def _async_camera_image(self) -> bytes | None:
+        self._observe_cleaning_state()
+        if (retained := self._retained_image()) is not None:
+            return retained
+        generation = self._cleaning_generation
         # ── Refresh persistent map if cache is stale ──────────────────────────
         async with self._cache_lock:
             age = time.monotonic() - self._cache_ts
             if self._map_data is None or self._metadata is None or age > _STATIC_CACHE_TTL:
                 await self._async_refresh_static_map()
+
+        self._observe_cleaning_state()
+        if generation != self._cleaning_generation:
+            return self._retained_image() or self._last_image
 
         if self._map_data is None:
             # First fetch failed — return last image or None
@@ -159,13 +272,20 @@ class DysonMapCamera(Camera):
 
         # ── Fetch live data if cleaning ───────────────────────────────────────
         live_data: dict[str, Any] | None = None
-        cleaning = (
-            self._coordinator.mqtt is not None
-            and self._coordinator.mqtt.connected
-            and is_any_cleaning(self._coordinator.mqtt.state)
-        )
+        cleaning = self._fetch_live_map()
         if cleaning:
             live_data = await self._coordinator.async_get_live_map()
+
+        self._observe_cleaning_state()
+        retained = self._retained_image()
+        if generation != self._cleaning_generation or retained is not None:
+            return retained or self._last_image
+
+        # A temporary empty live snapshot must not erase an already drawn path,
+        # particularly while switching from vacuuming to mopping.
+        has_path = bool(live_data and len(live_data.get("cleanPath") or []) >= 2)
+        if cleaning and not has_path and self._last_cleaning_image is not None:
+            return self._last_cleaning_image
 
         # If cleaning but the fetch failed (rate-limited or transient error),
         # return the last known good frame rather than rendering a pathless image.
@@ -219,6 +339,10 @@ class DysonMapCamera(Camera):
                 patched_map["zones"] = patched_zones
 
         # ── Render in executor (CPU-bound) ────────────────────────────────────
+        self._observe_cleaning_state()
+        retained = self._retained_image()
+        if generation != self._cleaning_generation or retained is not None:
+            return retained or self._last_image
         try:
             image_bytes: bytes = await self.hass.async_add_executor_job(
                 render_map,
@@ -226,7 +350,13 @@ class DysonMapCamera(Camera):
                 self._metadata,
                 live_data,
             )
+            self._observe_cleaning_state()
+            retained = self._retained_image()
+            if generation != self._cleaning_generation or retained is not None:
+                return retained or self._last_image
             self._last_image = image_bytes
+            if has_path and image_bytes:
+                self._last_cleaning_image = image_bytes
             return image_bytes
         except Exception as exc:  # pylint: disable=broad-except
             _LOGGER.error("[%s] Map render failed: %s", self._serial, exc)
@@ -240,10 +370,14 @@ class DysonMapCamera(Camera):
         Must be called while ``_cache_lock`` is held.
         Logs warnings and leaves cached data unchanged on errors.
         """
+        generation = self._cleaning_generation
         try:
             _LOGGER.debug("[%s] Refreshing persistent map data", self._serial)
             _, map_data = await get_current_map(self._token, self._serial)
             metadata    = await get_map_metadata(self._token, self._serial)
+            self._observe_cleaning_state()
+            if generation != self._cleaning_generation:
+                return
             self._map_data  = map_data
             self._metadata  = metadata
             self._cache_ts  = time.monotonic()

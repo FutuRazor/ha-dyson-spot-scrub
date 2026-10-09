@@ -80,6 +80,7 @@ class DysonCoordinator:
         self._live_map_fetched_at: float = 0.0
         self._live_map_backoff_until: float = 0.0
         self._live_map_lock: asyncio.Lock = asyncio.Lock()
+        self._live_map_generation = 0
 
     # ── Setup / teardown ──────────────────────────────────────────────────────
 
@@ -198,6 +199,12 @@ class DysonCoordinator:
 
     # ── Live-map fetch (shared across camera viewers) ─────────────────────────
 
+    @callback
+    def async_clear_live_map_cache(self) -> None:
+        """Discard an old session's map without cancelling a rate-limit backoff."""
+        self._live_map_generation += 1
+        self._live_map_cache = None
+
     async def async_get_live_map(self) -> dict | None:
         """Fetch the live cleaning map, shared across all viewers.
 
@@ -239,7 +246,10 @@ class DysonCoordinator:
                 return self._live_map_cache
 
             try:
+                generation = self._live_map_generation
                 data = await get_live_map(self._token, self.serial)
+                if generation != self._live_map_generation:
+                    return None
                 self._live_map_cache = data
                 self._live_map_fetched_at = time.monotonic()
                 return data
