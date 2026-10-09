@@ -243,11 +243,11 @@ class DysonCoordinator:
                 if "429" in raw:
                     # Parse the Retry-After value embedded by get_live_map()
                     retry_after = 30.0
-                    if "Retry-After" in raw:
+                    for part in raw.split():
                         try:
-                            after_keyword = raw.split("Retry-After", 1)[1]
-                            retry_after = max(5.0, float(after_keyword.strip().rstrip(")").split()[0]))
-                        except (ValueError, IndexError):
+                            retry_after = max(5.0, float(part))
+                            break
+                        except ValueError:
                             pass
                     self._live_map_backoff_until = time.monotonic() + retry_after
                     _LOGGER.warning(
