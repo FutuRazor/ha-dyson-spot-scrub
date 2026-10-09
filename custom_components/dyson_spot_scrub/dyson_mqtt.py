@@ -14,7 +14,7 @@ Four cleaning modes (via start_mode):
   0 = Vacuum only
   1 = Vacuum + Mop (simultaneous)
   2 = Mop only
-  3 = Vacuum then Mop (sequential, detected by sweep_type == 7)
+  3 = Vacuum then Mop (sequential)
 """
 from __future__ import annotations
 
@@ -56,16 +56,18 @@ def is_running(state: dict) -> bool:
 
 
 def is_vacuum_then_mop(state: dict) -> bool:
-    """Vacuum-then-mop sequential — detected via sweep_type == 7."""
-    return is_running(state) and state.get("sweepType") == 7
+    """Vacuum-then-mop sequential.
+
+    sweep_type 7 appears across all run types (confirmed Oct 2026, FutuRazor),
+    so it is not a reliable discriminator.  This function currently returns False;
+    both phases of a V-then-M run are covered by is_vacuuming_only / is_mopping.
+    A better signal will be wired in once MQTT captures confirm it.
+    """
+    return False
 
 
 def is_vacuuming_only(state: dict) -> bool:
-    return (
-        is_running(state)
-        and state.get("fullCleanAction") == "VACUUMING"
-        and state.get("sweepType") != 7
-    )
+    return is_running(state) and state.get("fullCleanAction") == "VACUUMING"
 
 
 def is_vacuuming_and_mopping(state: dict) -> bool:
@@ -73,11 +75,7 @@ def is_vacuuming_and_mopping(state: dict) -> bool:
 
 
 def is_mopping(state: dict) -> bool:
-    return (
-        is_running(state)
-        and state.get("fullCleanAction") == "MOPPING"
-        and state.get("sweepType") != 7
-    )
+    return is_running(state) and state.get("fullCleanAction") == "MOPPING"
 
 
 def is_any_cleaning(state: dict) -> bool:
