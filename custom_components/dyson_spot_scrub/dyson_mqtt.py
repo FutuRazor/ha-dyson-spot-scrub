@@ -25,6 +25,7 @@ import random
 import re
 import ssl
 import threading
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.parse import quote
@@ -32,6 +33,8 @@ from urllib.parse import quote
 import paho.mqtt.client as mqtt
 
 _LOGGER = logging.getLogger(__name__)
+
+_PREFERENCE_TIMEOUT = 10.0
 
 # ── State classification ──────────────────────────────────────────────────────
 
@@ -204,10 +207,13 @@ class DysonMqttClient:
         # Callbacks
         self.on_prefix_changed: Callable[[str], None] | None = None
 
-        # Single retry timer for start_mode — prevents runaway thread spawning
-        self._start_retry_timer: threading.Timer | None = None
-        self._start_retry_mode:  int | None = None
-        self._start_retry_count: int = 0
+        # Start calls run in HA's executor; MQTT replies arrive on paho's thread.
+        self._start_lock = threading.Lock()
+        self._preference_lock = threading.RLock()
+        self._preference_ready = threading.Event()
+        self._preference_request_id: str | None = None
+        self._preference_response: dict | None = None
+        self._start_cancelled = False
 
         # Registered callbacks — called on every state change
         self._state_callbacks: list[Callable[[dict], None]] = []
@@ -289,6 +295,7 @@ class DysonMqttClient:
         client.loop_start()
 
     def disconnect(self) -> None:
+        self._cancel_pending_start()
         with self._lock:
             c = self._client
             self._client = None
@@ -300,126 +307,28 @@ class DysonMqttClient:
     def request_current_state(self) -> None:
         self._publish({"msg": "REQUEST-CURRENT-STATE", "time": _now_iso()})
 
-    def start_mode(self, mode: int) -> None:
-        """Start cleaning in one of four modes (0-3)."""
-        labels = ["vacuum only", "vacuum + mop", "mop only", "vacuum then mop"]
-        _LOGGER.info("[%s] → START (%s)", self.serial, labels[mode] if mode < 4 else mode)
+    def start_mode(self, mode: int) -> bool:
+        """Start all rooms in mode 0-3, preserving their other settings."""
+        return self._start_cleaning(mode)
 
-        # Cancel any pending retry for a different mode
-        if self._start_retry_mode != mode:
-            self._cancel_start_retry()
-            self._start_retry_count = 0
-            self._start_retry_mode = mode
-
-        # Mop-only: global clean in mop mode — no room preference needed
-        if mode == 2:
-            self._cancel_start_retry()
-            self._publish({
-                "msg":          "START",
-                "mode-reason":  "RAPP",
-                "cleaningMode": "global",
-                "time":         _now_iso(),
-            })
-            return
-
-        # All other modes need room preference cache
-        if not (self._cached_preference and self._cached_preference.get("room")):
-            self._start_retry_count += 1
-
-            # After 10 retries (~20 s), fall back to a basic global start
-            if self._start_retry_count > 10:
-                _LOGGER.warning(
-                    "[%s] Room preferences unavailable after %d retries — "
-                    "sending basic global start",
-                    self.serial, self._start_retry_count,
-                )
-                self._cancel_start_retry()
-                self._publish({
-                    "msg":          "START",
-                    "mode-reason":  "RAPP",
-                    "cleaningMode": "global",
-                    "time":         _now_iso(),
-                })
-                return
-
-            # Only schedule ONE retry at a time
-            if self._start_retry_timer is None:
-                _LOGGER.warning(
-                    "[%s] Room preferences not yet cached — retrying in 2 s (attempt %d/10)",
-                    self.serial, self._start_retry_count,
-                )
-                self._start_retry_timer = threading.Timer(
-                    2.0, self._do_start_retry
-                )
-                self._start_retry_timer.start()
-            return
-
-        pref    = self._cached_preference
-        map_id  = int(self.state.get("persistentMapId", 0))
-        room_ids = [r[0] for r in pref["room"]]
-        zone_ids = [str(r) for r in room_ids]
-
-        # Build 12-element preference arrays for every room.
-        # Index mapping confirmed from live data (Sep 2026):
-        #   [4]  = clean type (mode): 0=Vacuum+Wash, 2=Vacuum only
-        #   [8]  = enabled flag (1=yes)
-        #   [10] = 1-based sequence order
-        updated_rooms = []
-        for i, room in enumerate(pref["room"]):
-            r = list(room)
-            while len(r) < 12:
-                r.append(0)
-            r[4]  = mode   # clean type at confirmed index [4]
-            r[8]  = 1      # all rooms enabled for global clean
-            r[10] = i + 1  # 1-based order
-            updated_rooms.append(r[:12])
-
-        self._publish_jdm("service.set_preference", {
-            "map_id":          map_id,
-            "prefer_type":     1,
-            "room_preference": updated_rooms,
-            "uv_switch":       pref.get("uv_switch", []),
-        })
-
-        self._publish({
-            "msg":           "START",
-            "mode-reason":   "RAPP",
-            "cleaningMode":  "zoneConfigured",
-            "cleaningProgramme": {
-                "persistentMapId": str(map_id),
-                "unorderedZones":  zone_ids,
-            },
-            "time": _now_iso(),
-        })
-
-        self._publish_jdm("service.set_cur_map", {"map_id": map_id})
-        self._publish_jdm("service.set_room_clean",
-                           {"ctrl_value": 1, "clean_type": 0, "room_ids": room_ids})
-
-    def _cancel_start_retry(self) -> None:
-        """Cancel the pending start-mode retry timer (if any)."""
-        t = self._start_retry_timer
-        self._start_retry_timer = None
-        if t is not None:
-            t.cancel()
-
-    def _do_start_retry(self) -> None:
-        """Called by the retry timer — clears the timer ref then retries."""
-        self._start_retry_timer = None
-        mode = self._start_retry_mode
-        if mode is not None:
-            self.start_mode(mode)
+    def _cancel_pending_start(self) -> None:
+        """Wake a pending preference read without allowing a delayed start."""
+        with self._preference_lock:
+            self._start_cancelled = True
+            self._preference_ready.set()
 
     def stop(self) -> None:
-        self._cancel_start_retry()
-        _LOGGER.info("[%s] → STOP", self.serial)
-        self._publish({"msg": "STOP", "mode-reason": "RAPP", "time": _now_iso()})
+        with self._preference_lock:
+            self._cancel_pending_start()
+            _LOGGER.info("[%s] → STOP", self.serial)
+            self._publish({"msg": "STOP", "mode-reason": "RAPP", "time": _now_iso()})
 
     def return_to_base(self) -> None:
-        self._cancel_start_retry()
-        _LOGGER.info("[%s] → RETURN_TO_BASE", self.serial)
-        self._publish({"msg": "ABORT", "mode-reason": "RAPP", "time": _now_iso()})
-        self._publish_jdm("service.start_recharge", {})
+        with self._preference_lock:
+            self._cancel_pending_start()
+            _LOGGER.info("[%s] → RETURN_TO_BASE", self.serial)
+            self._publish({"msg": "ABORT", "mode-reason": "RAPP", "time": _now_iso()})
+            self._publish_jdm("service.start_recharge", {})
 
     # ── Room listing ──────────────────────────────────────────────────────────
 
@@ -432,115 +341,125 @@ class DysonMqttClient:
 
     # ── Single-room clean ─────────────────────────────────────────────────────
 
-    def start_room(self, room_name: str, mode: int = 0) -> None:
-        """Start a single-room clean in the given cleaning mode.
+    def start_room(self, room_name: str, mode: int = 0) -> bool:
+        """Start one room, matching its normalised display name."""
+        return self._start_cleaning(mode, room_name)
 
-        mode: 0=Vacuum only, 1=Vacuum+Mop, 2=Mop only, 3=Vacuum then Mop.
+    def _start_cleaning(self, mode: int, room_name: str | None = None) -> bool:
+        """Read current preferences before editing mode and room selection.
 
-        Sends the same 4-command JDM sequence the Dyson app uses:
-          1. service.set_preference  — 12-element arrays; only the target room
-                                       has index[8]=1 (enabled).
-          2. START                   — cleaningMode "zoneConfigured" with only
-                                       the target room in unorderedZones.
-          3. service.set_cur_map     — confirms the active map.
-          4. service.set_room_clean  — triggers execution.
-
-        room_name is matched case-insensitively against the normalised display
-        names returned by room_names (e.g. "Living Room", "Kitchen", "Dining").
+        Called from an executor, never the MQTT callback or HA event-loop thread.
+        Keep the existing four-command start sequence; only its room payload is
+        corrected here. A failed refresh must not fall back to stale preferences.
         """
-        _LOGGER.info("[%s] → START ROOM '%s'", self.serial, room_name)
-        self._cancel_start_retry()
+        if mode not in (0, 1, 2, 3):
+            _LOGGER.warning("[%s] Cannot start: invalid cleaning mode %r", self.serial, mode)
+            return False
+        if not self._start_lock.acquire(blocking=False):
+            _LOGGER.warning("[%s] Cannot start: another start is pending", self.serial)
+            return False
+        try:
+            with self._preference_lock:
+                self._start_cancelled = False
+                if not self.connected:
+                    _LOGGER.warning("[%s] Cannot start: MQTT disconnected", self.serial)
+                    return False
+                try:
+                    map_id = int(self.state["persistentMapId"])
+                except (KeyError, TypeError, ValueError):
+                    _LOGGER.warning("[%s] Cannot start: current map unavailable", self.serial)
+                    return False
+                request_id = _rand_msg_id()
+                self._preference_request_id = request_id
+                self._preference_response = None
+                self._preference_ready.clear()
+                self._publish_raw(self._jdm_command_topic, {
+                    "msgId": request_id,
+                    "version": "1.0.1",
+                    "method": "service.get_preference",
+                    "params": {"map_id": map_id},
+                    "time": _now_iso(),
+                })
 
-        if not (self._cached_preference and self._cached_preference.get("room")):
-            _LOGGER.warning(
-                "[%s] Room preferences not cached — cannot start room clean for '%s'",
-                self.serial, room_name,
-            )
-            return
+            received = self._preference_ready.wait(_PREFERENCE_TIMEOUT)
+            with self._preference_lock:
+                if self._start_cancelled or not self.connected:
+                    _LOGGER.info("[%s] Pending cleaning start cancelled", self.serial)
+                    return False
+                if str(self.state.get("persistentMapId")) != str(map_id):
+                    _LOGGER.warning("[%s] Cannot start: current map changed", self.serial)
+                    return False
+                pref = self._preference_response
+                if not received or pref is None:
+                    _LOGGER.warning(
+                        "[%s] Cannot start: no successful room-preference response "
+                        "within %.0f s; existing settings were not overwritten",
+                        self.serial, _PREFERENCE_TIMEOUT,
+                    )
+                    return False
+                rooms = pref.get("room")
+                if not isinstance(rooms, list) or not rooms or any(
+                    not isinstance(room, list) or len(room) < 11
+                    or not isinstance(room[0], (int, str)) for room in rooms
+                ):
+                    _LOGGER.warning("[%s] Cannot start: incomplete room preferences", self.serial)
+                    return False
+                if room_name is None:
+                    selected = rooms
+                else:
+                    selected = [room for room in rooms if
+                                _room_display_name(room[1]).casefold() == room_name.strip().casefold()]
+                    if len(selected) != 1:
+                        _LOGGER.warning(
+                            "[%s] Cannot start: room %r is missing or ambiguous",
+                            self.serial, room_name,
+                        )
+                        return False
+                room_ids = [room[0] for room in selected]
+                if len({room[0] for room in rooms}) != len(rooms):
+                    _LOGGER.warning("[%s] Cannot start: duplicate room IDs", self.serial)
+                    return False
 
-        pref   = self._cached_preference
-        map_id = int(self.state.get("persistentMapId", 0))
-        target_key = room_name.strip().lower()
+                # App captures (Oct 2026): [3] mode, [4] strategy, [5] water,
+                # [6] mop passes, [8] selected. Preserve names, order, unknown
+                # fields and any trailing fields returned by get_preference.
+                updated_rooms = deepcopy(rooms)
+                for room in updated_rooms:
+                    enabled = room[0] in room_ids
+                    room[8] = int(enabled)
+                    if enabled:
+                        room[3] = mode
 
-        # Find the target room by normalised display-name (case-insensitive)
-        target_room: list | None = None
-        for room in pref["room"]:
-            if _room_display_name(room[1]).lower() == target_key:
-                target_room = room
-                break
-
-        if target_room is None:
-            available = [_room_display_name(r[1]) for r in pref["room"]]
-            _LOGGER.warning(
-                "[%s] Room '%s' not found. Available rooms: %s",
-                self.serial, room_name, available,
-            )
-            return
-
-        target_id = target_room[0]
-
-        def _pref_entry(room: list, is_target: bool, order: int) -> list:
-            """Build a 12-element preference array matching the robot's own format.
-
-            Index mapping confirmed from live data (Sep 2026):
-              [0]  room_id
-              [1]  display name
-              [2]  unknown — always 0; preserved from cache
-              [3]  unknown — always 0; preserved from cache
-              [4]  clean type: 0=Vacuum+Wash, 2=Vacuum only (others TBC)
-              [5]  hydration level (0=none/low, 2=high; TBC)
-              [6]  unknown — always 0
-              [7]  unknown — always 0
-              [8]  enabled in clean sequence (1=yes, 0=no)
-              [9]  unknown — always 0
-              [10] 1-based position in clean order
-              [11] unknown — always 0; newer firmware field
-            """
-            return [
-                room[0],                               # [0]  room_id
-                _room_display_name(room[1]),           # [1]  normalised name
-                room[2] if len(room) > 2 else 0,      # [2]  preserve (always 0)
-                room[3] if len(room) > 3 else 0,      # [3]  preserve (always 0)
-                mode,                                  # [4]  clean type (caller-supplied)
-                room[5] if len(room) > 5 else 0,      # [5]  hydration — preserve from cache
-                0,                                     # [6]
-                0,                                     # [7]
-                1 if is_target else 0,                 # [8]  enabled flag
-                0,                                     # [9]
-                order,                                 # [10] 1-based clean order
-                room[11] if len(room) > 11 else 0,    # [11] newer firmware field
-            ]
-
-        # Target room first (order=1), then all others in cache order
-        pref_entries: list[list] = [_pref_entry(target_room, True, 1)]
-        order = 2
-        for room in pref["room"]:
-            if room[0] == target_id:
-                continue
-            pref_entries.append(_pref_entry(room, False, order))
-            order += 1
-
-        self._publish_jdm("service.set_preference", {
-            "map_id":          map_id,
-            "prefer_type":     1,
-            "room_preference": pref_entries,
-            "uv_switch":       pref.get("uv_switch", []),
-        })
-
-        self._publish({
-            "msg":          "START",
-            "mode-reason":  "RAPP",
-            "cleaningMode": "zoneConfigured",
-            "cleaningProgramme": {
-                "persistentMapId": str(map_id),
-                "unorderedZones":  [str(target_id)],
-            },
-            "time": _now_iso(),
-        })
-
-        self._publish_jdm("service.set_cur_map", {"map_id": map_id})
-        self._publish_jdm("service.set_room_clean",
-                          {"ctrl_value": 1, "clean_type": 0, "room_ids": [target_id]})
+                _LOGGER.info(
+                    "[%s] Starting cleaning mode %s in rooms %s with refreshed preferences",
+                    self.serial, mode, room_ids,
+                )
+                self._publish_jdm("service.set_preference", {
+                    "map_id": map_id,
+                    "prefer_type": 1,
+                    "room_preference": updated_rooms,
+                    "uv_switch": deepcopy(pref.get("uv_switch", [])),
+                })
+                self._publish({
+                    "msg": "START",
+                    "mode-reason": "RAPP",
+                    "cleaningMode": "zoneConfigured",
+                    "cleaningProgramme": {
+                        "persistentMapId": str(map_id),
+                        "unorderedZones": [str(room_id) for room_id in room_ids],
+                    },
+                    "time": _now_iso(),
+                })
+                self._publish_jdm("service.set_cur_map", {"map_id": map_id})
+                self._publish_jdm("service.set_room_clean", {
+                    "ctrl_value": 1, "clean_type": 0, "room_ids": room_ids,
+                })
+                return True
+        finally:
+            with self._preference_lock:
+                self._preference_request_id = None
+                self._preference_response = None
+            self._start_lock.release()
 
     # ── paho callbacks ────────────────────────────────────────────────────────
 
@@ -577,6 +496,7 @@ class DysonMqttClient:
         self._disconnected_handled = True
         _LOGGER.warning("[%s] MQTT disconnected (rc=%s)", self.serial, rc)
         self.connected = False
+        self._cancel_pending_start()
         if self.on_disconnected:
             self.on_disconnected()
 
@@ -627,8 +547,16 @@ class DysonMqttClient:
             self._merge_jdm_props(data["params"])
         elif method == "prop.get" and data.get("data"):
             self._merge_jdm_props(data["data"])
-        elif method == "service.get_preference" and data.get("data"):
-            pref = data["data"]
+        elif method == "service.get_preference":
+            pref = data.get("data")
+            success = data.get("code") == 0 and isinstance(pref, dict)
+            with self._preference_lock:
+                if (self._preference_request_id is not None
+                        and str(data.get("msgId")) == self._preference_request_id):
+                    self._preference_response = deepcopy(pref) if success else None
+                    self._preference_ready.set()
+            if not success or not isinstance(pref.get("room"), list):
+                return
             n = len(pref.get("room", []))
             if n == 0:
                 _LOGGER.debug("[%s] get_preference: 0 rooms (map probe)", self.serial)

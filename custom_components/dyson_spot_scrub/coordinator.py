@@ -347,7 +347,14 @@ class DysonCoordinator:
             _LOGGER.info("[%s] Sequential clean → '%s'", self.serial, room)
             from .const import MODE_TO_INT
             mode_int = MODE_TO_INT.get(self.current_mode, 0)
-            await self.hass.async_add_executor_job(self.mqtt.start_room, room, mode_int)
+            started = await self.hass.async_add_executor_job(
+                self.mqtt.start_room, room, mode_int,
+            )
+            if not started:
+                _LOGGER.warning(
+                    "[%s] Sequential clean stopped: could not start %r", self.serial, room,
+                )
+                return
             await self._async_wait_for_clean_complete()
         _LOGGER.info("[%s] Sequential clean finished all rooms", self.serial)
 
