@@ -114,7 +114,6 @@ class DysonVacuumEntity(StateVacuumEntity):
         self._product_type  = entry.data.get(CONF_PRODUCT_TYPE, "RB0S")
 
         self._attr_unique_id = f"{self._serial}_vacuum"
-        self._attr_fan_speed = coordinator.current_mode
 
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, self._serial)},
@@ -157,7 +156,7 @@ class DysonVacuumEntity(StateVacuumEntity):
 
     @property
     def fan_speed(self) -> str:
-        return self._attr_fan_speed
+        return self._coordinator.current_mode or DEFAULT_MODE
 
     @property
     def _mqtt_state(self) -> dict:
@@ -192,7 +191,7 @@ class DysonVacuumEntity(StateVacuumEntity):
     # ── Commands ──────────────────────────────────────────────────────────────
 
     async def async_start(self) -> None:
-        mode_int = MODE_TO_INT.get(self._attr_fan_speed, 0)
+        mode_int = MODE_TO_INT.get(self._coordinator.current_mode, 0)
         await self.hass.async_add_executor_job(
             self._coordinator.mqtt.start_mode, mode_int
         )
@@ -210,9 +209,8 @@ class DysonVacuumEntity(StateVacuumEntity):
         if fan_speed not in CLEANING_MODES:
             _LOGGER.warning("Unknown fan speed/mode: %s", fan_speed)
             return
-        self._attr_fan_speed = fan_speed
         self._coordinator.current_mode = fan_speed
-        self.async_write_ha_state()
+        self._coordinator._async_notify_listeners()
 
         # If the robot is currently cleaning, switch to the new mode immediately
         if is_any_cleaning(self._mqtt_state):
