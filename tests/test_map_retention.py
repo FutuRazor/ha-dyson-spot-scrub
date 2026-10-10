@@ -61,6 +61,7 @@ package = module('retention_integration')
 package.__path__ = [str(Path(__file__).resolve().parents[1] /
                         'custom_components/dyson_spot_scrub')]
 module('retention_integration.dyson_api', DysonApiError=ApiError,
+       DysonRateLimitError=ApiError,
        get_current_map=AsyncMock(), get_map_metadata=AsyncMock(),
        get_live_map=AsyncMock(), get_iot_credentials=AsyncMock())
 camera_module = importlib.import_module('retention_integration.camera')

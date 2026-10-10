@@ -70,6 +70,9 @@ class DysonCoordinator:
         # Rooms whose switch entity is toggled ON (for sequential clean)
         self.enabled_rooms: set[str] = set()
 
+        # Sequential cleaning task — retained so stop/return_to_base can cancel it
+        self._cleaning_task: asyncio.Task | None = None
+
         # Reconnect state
         self._shutting_down: bool = False
         self._reconnect_task: asyncio.Task | None = None
@@ -131,11 +134,18 @@ class DysonCoordinator:
         new_client.on_prefix_changed = self._on_mqtt_prefix_changed
         new_client.register_callback(self._on_state_change)
 
-        await self.hass.async_add_executor_job(new_client.connect)
+        # P1 #5: Assign before connecting so async_shutdown can disconnect
+        # the client if it is called while connect() is blocking in the executor.
         self.mqtt = new_client
+        try:
+            await self.hass.async_add_executor_job(new_client.connect)
+        except Exception:
+            self.mqtt = None
+            raise
 
     async def async_shutdown(self) -> None:
         self._shutting_down = True
+        await self._async_cancel_cleaning_task()
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
             try:
@@ -148,45 +158,48 @@ class DysonCoordinator:
     # ── Reconnect logic ───────────────────────────────────────────────────────
 
     async def _async_reconnect(self) -> None:
-        """Reconnect to Dyson's cloud MQTT broker, with backoff.
+        """Reconnect loop — runs until connected or shut down.
 
-        Fetches fresh IoT credentials on each attempt — the tokens expire
-        so they must not be cached across reconnects.
+        P1 #4: self-contained loop (not recursive) so a disconnect that fires
+        while we are sleeping in back-off does not orphan the retry chain.
+        Fetches fresh IoT credentials on each attempt because the tokens expire.
         """
-        delay = _RECONNECT_DELAYS[
-            min(self._reconnect_attempt, len(_RECONNECT_DELAYS) - 1)
-        ]
-        self._reconnect_attempt += 1
-        _LOGGER.info(
-            "[%s] Reconnect attempt %d — waiting %d s before retrying",
-            self.serial, self._reconnect_attempt, delay,
-        )
-        await asyncio.sleep(delay)
-
-        if self._shutting_down:
-            return
-
-        # Tear down the old client cleanly (stop its loop thread)
-        old_mqtt = self.mqtt
-        self.mqtt = None
-        if old_mqtt:
-            try:
-                await self.hass.async_add_executor_job(old_mqtt.disconnect)
-            except Exception:
-                pass
-
-        try:
-            await self._async_connect_cloud()
-            self._reconnect_attempt = 0  # Reset backoff on success
-            _LOGGER.info("[%s] Reconnected to cloud broker successfully", self.serial)
-        except Exception:
-            _LOGGER.exception(
-                "[%s] Reconnect failed — scheduling retry", self.serial
+        while not self._shutting_down:
+            delay = _RECONNECT_DELAYS[
+                min(self._reconnect_attempt, len(_RECONNECT_DELAYS) - 1)
+            ]
+            self._reconnect_attempt += 1
+            _LOGGER.info(
+                "[%s] Reconnect attempt %d — waiting %d s before retrying",
+                self.serial, self._reconnect_attempt, delay,
             )
-            if not self._shutting_down:
-                self._reconnect_task = self.hass.async_create_task(
-                    self._async_reconnect()
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+
+            if self._shutting_down:
+                return
+
+            # Tear down the old client cleanly (stop its loop thread)
+            old_mqtt = self.mqtt
+            self.mqtt = None
+            if old_mqtt:
+                try:
+                    await self.hass.async_add_executor_job(old_mqtt.disconnect)
+                except Exception:
+                    pass
+
+            try:
+                await self._async_connect_cloud()
+                self._reconnect_attempt = 0  # Reset backoff on success
+                _LOGGER.info("[%s] Reconnected to cloud broker successfully", self.serial)
+                return  # Done — exit the loop
+            except Exception:
+                _LOGGER.exception(
+                    "[%s] Reconnect failed — retrying", self.serial
                 )
+                # Loop continues to next iteration with updated backoff
 
     # ── Entity registration ───────────────────────────────────────────────────
 
@@ -335,28 +348,56 @@ class DysonCoordinator:
 
     # ── Sequential multi-room cleaning ────────────────────────────────────────
 
+    async def _async_cancel_cleaning_task(self) -> None:
+        """Cancel any in-flight sequential room-cleaning task."""
+        task = self._cleaning_task
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._cleaning_task = None
+
+    async def async_stop(self) -> None:
+        """Stop cleaning and cancel any sequential room task (P1 #2)."""
+        await self._async_cancel_cleaning_task()
+        if self.mqtt and self.mqtt.connected:
+            await self.hass.async_add_executor_job(self.mqtt.stop)
+
+    async def async_return_to_base(self) -> None:
+        """Return to base and cancel any sequential room task (P1 #2)."""
+        await self._async_cancel_cleaning_task()
+        if self.mqtt and self.mqtt.connected:
+            await self.hass.async_add_executor_job(self.mqtt.return_to_base)
+
     async def async_clean_rooms_sequential(self, room_names: list[str]) -> None:
         """Clean a list of rooms one at a time, waiting for docking between each."""
         if not room_names:
             return
-        _LOGGER.info("[%s] Sequential clean starting — rooms: %s", self.serial, room_names)
-        for room in room_names:
-            if not self.mqtt or not self.mqtt.connected:
-                _LOGGER.warning("[%s] MQTT not connected — aborting sequential clean", self.serial)
-                return
-            _LOGGER.info("[%s] Sequential clean → '%s'", self.serial, room)
-            from .const import MODE_TO_INT
-            mode_int = MODE_TO_INT.get(self.current_mode, 0)
-            started = await self.hass.async_add_executor_job(
-                self.mqtt.start_room, room, mode_int,
-            )
-            if not started:
-                _LOGGER.warning(
-                    "[%s] Sequential clean stopped: could not start %r", self.serial, room,
+        # P1 #2: record this task so stop/return_to_base can cancel it
+        self._cleaning_task = asyncio.current_task()
+        try:
+            _LOGGER.info("[%s] Sequential clean starting — rooms: %s", self.serial, room_names)
+            for room in room_names:
+                if not self.mqtt or not self.mqtt.connected:
+                    _LOGGER.warning("[%s] MQTT not connected — aborting sequential clean", self.serial)
+                    return
+                _LOGGER.info("[%s] Sequential clean → '%s'", self.serial, room)
+                from .const import MODE_TO_INT
+                mode_int = MODE_TO_INT.get(self.current_mode, 0)
+                started = await self.hass.async_add_executor_job(
+                    self.mqtt.start_room, room, mode_int,
                 )
-                return
-            await self._async_wait_for_clean_complete()
-        _LOGGER.info("[%s] Sequential clean finished all rooms", self.serial)
+                if not started:
+                    _LOGGER.warning(
+                        "[%s] Sequential clean stopped: could not start %r", self.serial, room,
+                    )
+                    return
+                await self._async_wait_for_clean_complete()
+            _LOGGER.info("[%s] Sequential clean finished all rooms", self.serial)
+        finally:
+            self._cleaning_task = None
 
     async def _async_wait_for_clean_complete(self, timeout: float = 3600.0) -> None:
         """Wait until the robot returns to dock (or times out)."""

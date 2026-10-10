@@ -40,6 +40,7 @@ class RoomSettingsTests(unittest.TestCase):
                 "homeassistant.core", HomeAssistant=object, callback=lambda f: f),
             "room_test_integration.dyson_api": module(
                 "room_test_integration.dyson_api", DysonApiError=Exception,
+                DysonRateLimitError=Exception,
                 get_iot_credentials=AsyncMock(), get_live_map=AsyncMock()),
         }))
         self.mqtt = importlib.import_module("room_test_integration.dyson_mqtt")
@@ -102,7 +103,8 @@ class RoomSettingsTests(unittest.TestCase):
                     self.assertEqual(self.client._cached_preference, original)
                     commands = [p.get("method", p.get("msg")) for _, p in self.sent]
                     self.assertEqual(commands, ["service.get_preference", "service.set_preference",
-                                               "START", "service.set_cur_map", "service.set_room_clean"])
+                                               "ABORT-DOCK-ACTION", "START",
+                                               "service.set_cur_map", "service.set_room_clean"])
                     self.assertEqual(self.sent[-1][1]["params"]["room_ids"], [12])
 
     def test_vacuum_then_mop_does_not_turn_auto_into_quick(self):

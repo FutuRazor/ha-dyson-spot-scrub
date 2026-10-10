@@ -181,10 +181,12 @@ class DysonVacuumEntity(StateVacuumEntity):
         )
 
     async def async_stop(self, **kwargs: Any) -> None:
-        await self.hass.async_add_executor_job(self._coordinator.mqtt.stop)
+        """Stop cleaning; also cancels any in-flight sequential room task (P1 #2)."""
+        await self._coordinator.async_stop()
 
     async def async_return_to_base(self, **kwargs: Any) -> None:
-        await self.hass.async_add_executor_job(self._coordinator.mqtt.return_to_base)
+        """Return to base; also cancels any in-flight sequential room task (P1 #2)."""
+        await self._coordinator.async_return_to_base()
 
     async def async_set_fan_speed(self, fan_speed: str, **kwargs: Any) -> None:
         """Select a cleaning mode. If already cleaning, starts the new mode immediately."""
