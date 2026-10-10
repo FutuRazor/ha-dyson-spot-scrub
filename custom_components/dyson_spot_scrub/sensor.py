@@ -73,7 +73,7 @@ class DysonBatterySensor(SensorEntity):
     @property
     def native_value(self) -> int | None:
         if self._coordinator.mqtt:
-            return battery_level(self._coordinator.mqtt.state)
+            return battery_level(self._coordinator.state)
         return None
 
     @callback

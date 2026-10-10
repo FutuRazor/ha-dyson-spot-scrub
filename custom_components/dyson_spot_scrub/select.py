@@ -202,7 +202,7 @@ class DysonCleaningModeSelectEntity(SelectEntity):
         self._coordinator.current_mode = option
         self._coordinator._async_notify_listeners()
 
-        if self._coordinator.mqtt and is_any_cleaning(self._coordinator.mqtt.state):
+        if self._coordinator.mqtt and is_any_cleaning(self._coordinator.state):
             mode_int = MODE_TO_INT[option]
             await self.hass.async_add_executor_job(
                 self._coordinator.mqtt.start_mode, mode_int

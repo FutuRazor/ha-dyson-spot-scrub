@@ -73,6 +73,10 @@ class DysonCoordinator:
         # Sequential cleaning task — retained so stop/return_to_base can cancel it
         self._cleaning_task: asyncio.Task | None = None
 
+        # Last MQTT state snapshot — captured on the paho thread and applied on the
+        # HA event loop so fast transitions (e.g. FINISHED → RUNNING) are never lost.
+        self._state_snapshot: dict = {}
+
         # Reconnect state
         self._shutting_down: bool = False
         self._reconnect_task: asyncio.Task | None = None
@@ -283,8 +287,9 @@ class DysonCoordinator:
     # ── Internal callbacks (called from paho thread) ──────────────────────────
 
     def _on_state_change(self, state: dict) -> None:
-        """paho thread → schedule update on HA event loop."""
-        self.hass.loop.call_soon_threadsafe(self._async_update_rooms_and_notify)
+        """paho thread → copy snapshot then schedule application on HA event loop."""
+        snapshot = dict(state)  # copy here; mqtt.state may change before the loop runs
+        self.hass.loop.call_soon_threadsafe(self._async_apply_state, snapshot)
 
     def _on_mqtt_connected(self) -> None:
         self.hass.loop.call_soon_threadsafe(self._async_update_rooms_and_notify)
@@ -323,6 +328,12 @@ class DysonCoordinator:
                 )
 
     @callback
+    def _async_apply_state(self, snapshot: dict) -> None:
+        """Store the state snapshot then notify listeners (runs on HA event loop)."""
+        self._state_snapshot = snapshot
+        self._async_update_rooms_and_notify()
+
+    @callback
     def _async_update_rooms_and_notify(self) -> None:
         """Check for new room names from MQTT, persist if changed, then notify."""
         if self.mqtt:
@@ -337,6 +348,11 @@ class DysonCoordinator:
                     "[%s] Room names cached: %s", self.serial, new_rooms
                 )
         self._async_notify_listeners()
+
+    @property
+    def state(self) -> dict:
+        """Last MQTT state snapshot, set on the HA event loop."""
+        return self._state_snapshot
 
     @callback
     def _async_notify_listeners(self) -> None:
@@ -412,7 +428,7 @@ class DysonCoordinator:
             if not self.mqtt:
                 done_event.set()
                 return
-            state = self.mqtt.state
+            state = self.state  # snapshot — already on HA event loop
             if is_any_cleaning(state):
                 cleaning_started = True
             elif cleaning_started and (is_docked(state) or is_charging(state)):

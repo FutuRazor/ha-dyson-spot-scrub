@@ -79,9 +79,7 @@ class _DysonBinarySensorBase(BinarySensorEntity):
 
     @property
     def _mqtt_state(self) -> dict:
-        if self._coordinator.mqtt:
-            return self._coordinator.mqtt.state
-        return {}
+        return self._coordinator.state
 
     @callback
     def async_write_ha_state(self) -> None:

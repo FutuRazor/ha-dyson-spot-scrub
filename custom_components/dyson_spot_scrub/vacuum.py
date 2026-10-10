@@ -160,16 +160,14 @@ class DysonVacuumEntity(StateVacuumEntity):
 
     @property
     def _mqtt_state(self) -> dict:
-        if self._coordinator.mqtt:
-            return self._coordinator.mqtt.state
-        return {}
+        return self._coordinator.state
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Expose room names and fault diagnostics for automations."""
         attrs: dict[str, Any] = {}
         if self._coordinator.mqtt:
-            state = self._coordinator.mqtt.state
+            state = self._coordinator.state
 
             # Room list
             rooms = self._coordinator.mqtt.room_names
