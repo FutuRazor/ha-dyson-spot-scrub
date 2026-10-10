@@ -353,6 +353,60 @@ class DysonMqttClient:
             return []
         return [_room_display_name(r[1]) for r in self._cached_preference["room"]]
 
+    @property
+    def room_preferences(self) -> list[list]:
+        """Live list of room-preference arrays from the robot's map cache.
+
+        Each entry is a list with confirmed indices (FutuRazor MQTT captures, Oct 2026):
+          [0]  roomId            int
+          [1]  roomName          str (may be JSON-encoded; use _room_display_name)
+          [2]  unknown           (preserved)
+          [3]  cleaningMode      0=Vacuum  1=Vacuum+Mop  2=Mop  3=Vacuum then Mop
+          [4]  cleaningStrategy  0=Auto  1=Boost  2=Quiet  3=Quick
+          [5]  waterLevel        99=Very Low  0=Low  1=Medium  2=High
+          [6]  mopRepetitions    0=One pass  1=Two passes
+          [7]  unknown           (preserved)
+          [8]  selected          0=No  1=Yes  (managed by switch.py)
+          [9]  unknown           (preserved)
+          [10] roomOrder         int
+          [11] additional field  (preserved, newer firmware)
+
+        Returns a direct reference into the cache — callers may modify a room
+        entry in-place and then call set_room_preferences() to persist the change.
+        """
+        if self._cached_preference and isinstance(self._cached_preference.get("room"), list):
+            return self._cached_preference["room"]
+        return []
+
+    def set_room_preferences(self, rooms: list[list]) -> bool:
+        """Publish an updated room-preferences array to the robot.
+
+        Used by per-room select entities to persist a single-setting change
+        (cleaning mode, strategy, water level, or mop repetitions) without
+        starting a clean cycle.  Safe to call from any thread; does not block.
+        """
+        try:
+            map_id = int(self.state.get("persistentMapId", ""))
+        except (TypeError, ValueError):
+            _LOGGER.warning("[%s] set_room_preferences: no map ID available", self.serial)
+            return False
+        if not self.connected:
+            _LOGGER.warning("[%s] set_room_preferences: not connected", self.serial)
+            return False
+        uv_switch: list = []
+        if self._cached_preference:
+            uv_switch = deepcopy(self._cached_preference.get("uv_switch", []))
+        _LOGGER.debug(
+            "[%s] Persisting room preferences (%d room(s))", self.serial, len(rooms)
+        )
+        self._publish_jdm("service.set_preference", {
+            "map_id":          map_id,
+            "prefer_type":     1,
+            "room_preference": rooms,
+            "uv_switch":       uv_switch,
+        })
+        return True
+
     # ── Single-room clean ─────────────────────────────────────────────────────
 
     def start_room(self, room_name: str, mode: int = 0) -> bool:
