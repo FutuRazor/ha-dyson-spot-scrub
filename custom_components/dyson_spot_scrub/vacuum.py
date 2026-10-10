@@ -27,11 +27,14 @@ from .const import (
     DEFAULT_MODE,
 )
 from .coordinator import DysonCoordinator
+from .const import FAULT_CODE_MESSAGES
 from .dyson_mqtt import (
     is_any_cleaning,
     is_docked,
     is_charging,
     has_fault,
+    active_fault_code,
+    dock_needs_maintenance,
     RUNNING_STATES,
 )
 
@@ -164,12 +167,26 @@ class DysonVacuumEntity(StateVacuumEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Expose room names so automations can reference them."""
+        """Expose room names and fault diagnostics for automations."""
         attrs: dict[str, Any] = {}
         if self._coordinator.mqtt:
+            state = self._coordinator.mqtt.state
+
+            # Room list
             rooms = self._coordinator.mqtt.room_names
             if rooms:
                 attrs["rooms"] = rooms
+
+            # Actionable fault — human-readable string + raw code
+            code = active_fault_code(state)
+            if code is not None:
+                attrs["fault_code"] = code
+                attrs["fault"] = FAULT_CODE_MESSAGES.get(code, f"Fault {code}")
+
+            # Dock maintenance flag (code 2103 — informational, not ERROR)
+            if dock_needs_maintenance(state):
+                attrs["dock_maintenance"] = True
+
         return attrs
 
     # ── Commands ──────────────────────────────────────────────────────────────

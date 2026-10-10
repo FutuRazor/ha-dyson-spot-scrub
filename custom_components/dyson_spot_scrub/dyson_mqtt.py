@@ -109,6 +109,12 @@ def battery_level(state: dict) -> int | None:
 
 
 def has_fault(state: dict) -> bool:
+    """True when there is an actionable (non-informational) fault.
+
+    Informational codes (dock baseline 2105, maintenance log 2103) are excluded
+    so they never cause VacuumActivity.ERROR — see FAULT_CODE_INFORMATIONAL.
+    """
+    from .const import FAULT_CODE_INFORMATIONAL
     faults = state.get("activeFaults")
     if not isinstance(faults, list) or not faults:
         return False
@@ -118,8 +124,41 @@ def has_fault(state: dict) -> bool:
         #   prop.post / older firmware use "status"
         severity = f.get("nextActionRequired") or f.get("status")
         if severity is not None and severity != "LOG_ONLY":
+            fid = f.get("faultId")
+            if fid is not None and int(fid) in FAULT_CODE_INFORMATIONAL:
+                continue  # informational — skip
             return True
     return False
+
+
+def active_fault_code(state: dict) -> int | None:
+    """Return the first actionable fault code (faultId) from activeFaults, or None.
+
+    Skips LOG_ONLY faults and informational codes (2103, 2105).
+    Look the result up in FAULT_CODE_MESSAGES for a user-readable string.
+    """
+    from .const import FAULT_CODE_INFORMATIONAL
+    faults = state.get("activeFaults")
+    if not isinstance(faults, list):
+        return None
+    for f in faults:
+        severity = f.get("nextActionRequired") or f.get("status")
+        if severity is not None and severity != "LOG_ONLY":
+            fid = f.get("faultId")
+            if fid is not None and int(fid) not in FAULT_CODE_INFORMATIONAL:
+                return int(fid)
+    return None
+
+
+def dock_needs_maintenance(state: dict) -> bool:
+    """True when fault code 2103 is present (dock self-clean finished, needs emptying)."""
+    faults = state.get("activeFaults")
+    if not isinstance(faults, list):
+        return False
+    return any(
+        f.get("faultId") is not None and int(f.get("faultId", -1)) == 2103
+        for f in faults
+    )
 
 
 def _now_iso() -> str:

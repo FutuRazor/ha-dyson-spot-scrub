@@ -46,3 +46,22 @@ ROBOT_PRODUCT_PREFIXES = ("RB0", "276", "277", "804")
 
 # How long (seconds) to suppress snap-back on optimistic OFF
 OPTIMISTIC_OFF_TIMEOUT = 15
+
+# ── Fault code mapping (confirmed via hardware testing, FutuRazor Oct 2026) ──
+#
+# These codes appear in activeFaults[*].faultId in CURRENT-STATE messages.
+# 2105 is the normal dock-idle baseline and is excluded (LOG_ONLY severity).
+# 2103 is informational (dock maintenance log) — not a robot-stopping error.
+# 2108 / 2109 are actionable faults that surface as VacuumActivity.ERROR.
+
+# Codes that are purely informational — has_fault() and active_fault_code()
+# both skip these so they never trigger VacuumActivity.ERROR.
+FAULT_CODE_INFORMATIONAL: frozenset[int] = frozenset({2103, 2105})
+
+# Human-readable descriptions for faults we want to surface in HA attributes.
+# Keyed by faultId integer; only codes with a user-visible meaning are listed.
+FAULT_CODE_MESSAGES: dict[int, str] = {
+    2103: "Self-cleaning finished — check dock",  # dock maintenance log
+    2108: "Check clean water tank",               # FRESH_WATER_FAULT
+    2109: "Empty dirty water tank",               # DIRTY_WATER_FAULT
+}
