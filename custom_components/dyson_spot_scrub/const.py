@@ -47,21 +47,85 @@ ROBOT_PRODUCT_PREFIXES = ("RB0", "276", "277", "804")
 # How long (seconds) to suppress snap-back on optimistic OFF
 OPTIMISTIC_OFF_TIMEOUT = 15
 
-# ── Fault code mapping (confirmed via hardware testing, FutuRazor Oct 2026) ──
-#
-# These codes appear in activeFaults[*].faultId in CURRENT-STATE messages.
-# 2105 is the normal dock-idle baseline and is excluded (LOG_ONLY severity).
-# 2103 is informational (dock maintenance log) — not a robot-stopping error.
-# 2108 / 2109 are actionable faults that surface as VacuumActivity.ERROR.
 
-# Codes that are purely informational — has_fault() and active_fault_code()
-# both skip these so they never trigger VacuumActivity.ERROR.
+# ── Fault code mapping (hardware-verified, FutuRazor Oct 2026) ─────────────────────
+#
+# Codes appear in activeFaults[*].faultId in CURRENT-STATE messages on the
+# main /status topic.  Ghost-data codes (2108/2109) that leaked from app
+# polling cycles on /status/jdm are intentionally excluded.
+#
+# 2105 is the normal dock-idle baseline (LOG_ONLY) — excluded from has_fault()
+# and active_fault_code() so it never triggers VacuumActivity.ERROR.
+# 2103 is informational (dock maintenance log) — not a robot-stopping error.
+
 FAULT_CODE_INFORMATIONAL: frozenset[int] = frozenset({2103, 2105})
 
-# Human-readable descriptions for faults we want to surface in HA attributes.
-# Keyed by faultId integer; only codes with a user-visible meaning are listed.
+# Full verified dictionary from FutuRazor MQTT captures, Oct 2026.
 FAULT_CODE_MESSAGES: dict[int, str] = {
-    2103: "Self-cleaning finished — check dock",  # dock maintenance log
-    2108: "Check clean water tank",               # FRESH_WATER_FAULT
-    2109: "Empty dirty water tank",               # DIRTY_WATER_FAULT
+    # ── 3-digit codes ─────────────────────────────────────────────────────────────────
+    500: "LiDAR sensor obstructed",
+    501: "Wheels lifted",
+    502: "Battery is low",
+    503: "Robot's bin not detected",
+    504: "Gyroscopic sensor error",
+    507: "Unable to determine position",
+    508: "Unable to climb slope",
+    509: "Drop sensor obstructed",
+    510: "Collision sensor obstructed",
+    511: "Unable to return to dock",
+    513: "Robot stuck",
+    514: "Robot stuck",
+    516: "Battery temperature high",
+    518: "Battery is low",
+    521: "Dock's clean water tank not detected",
+    522: "Wet roller not detected",
+    560: "Side sweeper stuck",
+    561: "Camera obstructed",
+    562: "Wall follow sensor obstructed",
+    563: "Robot's bin not detected",
+    566: "Robot's dirty water tank not detected",
+    567: "Brush bar error",
+    568: "Left wheel stuck",
+    569: "Right wheel stuck",
+    570: "Brush bar error",
+    572: "Robot stuck",
+    581: "Dock's clean water tank empty",
+    582: "Dock's dirty water tank full",
+    583: "Dock's clean water tank not detected",
+    584: "Dock's dirty water tank not detected",
+    586: "Robot's dirty water tank full",
+    587: "Communication failure",
+    591: "Dock's bin full",
+    592: "Dock's filter error",
+    594: "Unable to empty robot's bin",
+    595: "Communication failure",
+    596: "Unable to empty robot's bin",
+    597: "Unable to empty robot's bin",
+    611: "Mapping failed",
+    612: "Mapping failed",
+    620: "Dock's cleaning solution empty",
+    627: "Something went wrong",
+    629: "Wet roller not detected",
+    630: "Wet roller stuck",
+    634: "Unable to return to dock",
+    636: "Robot stuck",
+    637: "Dock's clean water tank not detected",
+    639: "Wet roller not detected",
+    645: "Wet roller not detected",
+    646: "Wet roller error",
+    650: "Robot's dirty water tank not detected",
+    # ── 4-digit codes ─────────────────────────────────────────────────────────────────
+    2000: "Dock's bin full",
+    2003: "Unable to start scheduled clean",
+    2007: "Mapping failed",
+    2012: "Unable to reach area",
+    2103: "Self-cleaning finished — check dock",   # informational; see FAULT_CODE_INFORMATIONAL
+    2119: "Unable to start scheduled clean",
+    2123: "Dock's clean water pump error",
+    2124: "Dock's dirty water pump error",
+    2125: "Robot not charging",
+    2126: "Robot not charging",
+    2131: "Battery temperature too low",
+    2132: "Battery temperature too high",
+    2133: "Battery temperature too low",
 }

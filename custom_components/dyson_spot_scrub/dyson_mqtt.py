@@ -108,12 +108,23 @@ def battery_level(state: dict) -> int | None:
     return None
 
 
+def has_freeze_fault(state: dict) -> bool:
+    """True when work_mode 37 (hardware freeze block) is active.
+
+    Mapped from JDM prop.post 'work_mode' into coordinator state as 'workMode'.
+    A freeze block transitions from work_mode 36 (active run) → 37 (fault).
+    """
+    return state.get("workMode") == 37
+
+
 def has_fault(state: dict) -> bool:
     """True when there is an actionable (non-informational) fault.
 
     Informational codes (dock baseline 2105, maintenance log 2103) are excluded
     so they never cause VacuumActivity.ERROR — see FAULT_CODE_INFORMATIONAL.
     """
+    if has_freeze_fault(state):
+        return True
     from .const import FAULT_CODE_INFORMATIONAL
     faults = state.get("activeFaults")
     if not isinstance(faults, list) or not faults:
@@ -660,8 +671,6 @@ class DysonMqttClient:
 
         if method == "prop.post" and data.get("params"):
             self._merge_jdm_props(data["params"])
-        elif method == "prop.get" and data.get("data"):
-            self._merge_jdm_props(data["data"])
         elif method == "service.get_preference":
             pref = data.get("data")
             success = data.get("code") == 0 and isinstance(pref, dict)

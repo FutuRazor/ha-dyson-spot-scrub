@@ -184,6 +184,16 @@ class DysonVacuumEntity(StateVacuumEntity):
             if dock_needs_maintenance(state):
                 attrs["dock_maintenance"] = True
 
+            # Dock cycle state (IDLE / WASHING_MOP / DRYING_MOP / COLLECTING_DUST)
+            dock_state = state.get("dockState")
+            if dock_state:
+                attrs["dock_state"] = dock_state
+
+            # Active cleaning type (VACUUMING / MOPPING / VACUUMING_AND_MOPPING)
+            full_clean_action = state.get("fullCleanAction")
+            if full_clean_action and full_clean_action != "NONE":
+                attrs["full_clean_action"] = full_clean_action
+
         return attrs
 
     # ── Commands ──────────────────────────────────────────────────────────────
