@@ -120,12 +120,18 @@ def battery_level(state: dict) -> int | None:
 
 
 def has_freeze_fault(state: dict) -> bool:
-    """True when work_mode 37 (hardware freeze block) is active.
+    """Keep the legacy freeze heuristic, excluding confirmed pause signals.
 
-    Mapped from JDM prop.post 'work_mode' into coordinator state as 'workMode'.
-    A freeze block transitions from work_mode 36 (active run) → 37 (fault).
+    The 2026-10-13 capture reports work_mode=37, status=2 during a normal
+    FULL_CLEAN_PAUSED session with fault=0 and activeFaults=[]. JDM status
+    arrives before CURRENT-STATE, so either pause signal must suppress this
+    heuristic. Explicit actionable faults are still checked by has_fault().
     """
-    return state.get("workMode") == 37
+    return (
+        state.get("workMode") == 37
+        and state.get("jdmStatus") != 2
+        and not is_paused(state)
+    )
 
 
 def has_fault(state: dict) -> bool:
