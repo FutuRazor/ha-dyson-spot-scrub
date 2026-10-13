@@ -289,6 +289,17 @@ class DysonCoordinator:
                     _LOGGER.debug("[%s] Live-map fetch failed: %s", self.serial, exc)
                 # Return None so callers keep their last-good frame
                 return None
+            except Exception as exc:  # noqa: BLE001
+                # Transport-layer failures (aiohttp.ClientError, asyncio.TimeoutError,
+                # SSL errors, DNS failures, …) are not DysonApiError subclasses.
+                # Without this handler they would propagate through the lock, bypass
+                # the camera's "return last-good frame on None" fallback, and surface
+                # as an unhandled exception in the camera entity.
+                _LOGGER.warning(
+                    "[%s] Live-map fetch failed (transport error): %s: %s",
+                    self.serial, type(exc).__name__, exc,
+                )
+                return None
 
     # ── Internal callbacks (called from paho thread) ──────────────────────────
 
