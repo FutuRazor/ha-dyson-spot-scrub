@@ -44,6 +44,11 @@ _IDLE_INTERVAL     = 60.0   # slow poll when docked / idle / offline
 # How long to keep the persistent map data cached before re-fetching (seconds)
 _STATIC_CACHE_TTL  = 3600   # 1 hour
 
+# After a static-map fetch fails, wait at least this long before retrying.
+# Prevents a burst of camera polls (or multiple concurrent viewers) from
+# each making their own API call when the server is returning 503/429.
+_STATIC_CACHE_ERROR_BACKOFF = 30.0  # seconds
+
 # HA storage for zone presentation persistence
 _STORE_VERSION = 1
 
@@ -108,7 +113,8 @@ class DysonMapCamera(Camera):
         # Persistent map cache
         self._map_data:    dict[str, Any] | None = None
         self._metadata:    list[dict[str, Any]] | None = None
-        self._cache_ts:    float = 0.0          # epoch seconds of last fetch
+        self._cache_ts:    float = 0.0          # monotonic time of last successful fetch
+        self._cache_error_ts: float = 0.0       # monotonic time of last FAILED fetch
         self._cache_lock:  asyncio.Lock = asyncio.Lock()
 
         # Zone presentation (perimeter segment) cache.
@@ -259,7 +265,18 @@ class DysonMapCamera(Camera):
         # ── Refresh persistent map if cache is stale ──────────────────────────
         async with self._cache_lock:
             age = time.monotonic() - self._cache_ts
-            if self._map_data is None or self._metadata is None or age > _STATIC_CACHE_TTL:
+            needs_fetch = (
+                self._map_data is None
+                or self._metadata is None
+                or age > _STATIC_CACHE_TTL
+            )
+            # After a failed fetch, skip retries within the backoff window so
+            # a burst of concurrent camera polls doesn't each fire an API call.
+            backoff_active = (
+                (self._map_data is None or self._metadata is None)
+                and time.monotonic() - self._cache_error_ts < _STATIC_CACHE_ERROR_BACKOFF
+            )
+            if needs_fetch and not backoff_active:
                 await self._async_refresh_static_map()
 
         self._observe_cleaning_state()
@@ -396,12 +413,14 @@ class DysonMapCamera(Camera):
                 )
             _LOGGER.debug("[%s] Persistent map cached successfully", self._serial)
         except DysonApiError as exc:
+            self._cache_error_ts = time.monotonic()
             _LOGGER.warning(
                 "[%s] Failed to fetch persistent map: %s — "
-                "will retry on next camera poll",
-                self._serial, exc,
+                "will back off %.0f s before retrying",
+                self._serial, exc, _STATIC_CACHE_ERROR_BACKOFF,
             )
         except Exception as exc:  # pylint: disable=broad-except
+            self._cache_error_ts = time.monotonic()
             _LOGGER.error(
                 "[%s] Unexpected error fetching map: %s",
                 self._serial, exc,
