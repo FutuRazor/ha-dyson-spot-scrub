@@ -692,6 +692,9 @@ class DysonMqttClient:
                 self._notify_state_change()
             else:
                 _LOGGER.debug("[%s] Room preferences refreshed (%d room(s))", self.serial, n)
+                # Notify even on a refresh so room-switch entities update when
+                # the cache was replaced (e.g. stale wrong-map rooms → correct map).
+                self._notify_state_change()
 
     def _handle_status(self, data: dict) -> None:
         msg_type = data.get("msg") or data.get("method")
@@ -731,9 +734,23 @@ class DysonMqttClient:
                 _LOGGER.exception("[%s] Error in state callback", self.serial)
 
     def _probe_map_id(self, map_id: int) -> None:
-        """Send service.get_preference for one map_id — skip if already have rooms."""
+        """Send service.get_preference for one map_id.
+
+        Skips only when we already have rooms cached for this exact map.  Probes
+        for low integer IDs (0–3) fire speculatively at connection time before
+        the robot has reported persistentMapId; if one of those happens to return
+        rooms from a different map we must not let it block the authoritative
+        fetch that fires once the real persistentMapId arrives via MQTT state.
+        """
         if self._cached_preference and self._cached_preference.get("room"):
-            return
+            current_map_id = self.state.get("persistentMapId")
+            # Skip only when the robot hasn't reported its map yet (early probe
+            # race — any cached rooms are fine for now) OR the current map
+            # matches this probe (we already have the right rooms).
+            if current_map_id is None or str(current_map_id) == str(map_id):
+                return
+            # Current map differs from probe target — cache is stale; fall
+            # through to re-fetch so room entities show correct rooms.
         _LOGGER.debug("[%s] Probing map_id=%d for room preferences", self.serial, map_id)
         self._publish_raw(self._jdm_command_topic, {
             "msgId":   _rand_msg_id(),
