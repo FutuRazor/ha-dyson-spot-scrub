@@ -559,7 +559,7 @@ class DysonMqttClient:
                     "uv_switch": deepcopy(pref.get("uv_switch", [])),
                 })
                 self._abort_dock_action()
-                self._publish({
+                published = self._publish({
                     "msg": "START",
                     "mode-reason": "RAPP",
                     "cleaningMode": "zoneConfigured",
@@ -569,6 +569,12 @@ class DysonMqttClient:
                     },
                     "time": _now_iso(),
                 })
+                if not published:
+                    _LOGGER.warning(
+                        "[%s] Cannot start: START publish rejected by paho (rc != 0)",
+                        self.serial,
+                    )
+                    return False
                 self._publish_jdm("service.set_cur_map", {"map_id": map_id})
                 self._publish_jdm("service.set_room_clean", {
                     "ctrl_value": 1, "clean_type": 0, "room_ids": room_ids,
@@ -780,16 +786,24 @@ class DysonMqttClient:
             "time":    _now_iso(),
         })
 
-    def _publish(self, payload: dict) -> None:
-        self._publish_raw(self._command_topic, payload)
+    def _publish(self, payload: dict) -> bool:
+        """Publish to the robot's command topic; returns True on success."""
+        return self._publish_raw(self._command_topic, payload)
 
-    def _publish_raw(self, topic: str, payload: dict) -> None:
+    def _publish_raw(self, topic: str, payload: dict) -> bool:
+        """Publish a JSON payload; returns True if paho accepted the message."""
         with self._lock:
             client = self._client
         if not client or not self.connected:
             _LOGGER.warning("[%s] Cannot publish — not connected", self.serial)
-            return
+            return False
         body = json.dumps(payload)
         if self._verbose:
             _LOGGER.debug("[MQTT out] %s: %s", topic, body)
-        client.publish(topic, body, qos=0)
+        result = client.publish(topic, body, qos=0)
+        if result.rc != 0:
+            _LOGGER.warning(
+                "[%s] Publish failed (rc=%d) topic=%s", self.serial, result.rc, topic,
+            )
+            return False
+        return True
