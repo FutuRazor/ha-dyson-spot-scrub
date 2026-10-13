@@ -58,6 +58,17 @@ def is_running(state: dict) -> bool:
     return state.get("state") in RUNNING_STATES
 
 
+def is_paused(state: dict) -> bool:
+    """True when the robot is mid-clean but paused (FULL_CLEAN_PAUSED).
+
+    FULL_CLEAN_PAUSED is included in RUNNING_STATES so that is_any_cleaning()
+    continues to return True during a pause (the job is still in progress).
+    This helper lets callers that need to distinguish paused from actively
+    running do so without expanding the RUNNING_STATES check.
+    """
+    return state.get("state") == "FULL_CLEAN_PAUSED"
+
+
 def is_vacuum_then_mop(state: dict) -> bool:
     """Vacuum-then-mop sequential.
 
@@ -366,6 +377,36 @@ class DysonMqttClient:
         with self._preference_lock:
             self._start_cancelled = True
             self._preference_ready.set()
+
+    def pause(self) -> None:
+        """Pause an active clean.
+
+        Mirrors the Dyson app sequence (captured Oct 2026):
+        1. PAUSE on the command channel
+        2. service.set_room_clean with ctrl_value: 2 (pause signal) on JDM
+        Any in-flight start is cancelled first so the preference lock is
+        released and the PAUSE messages are sent immediately.
+        """
+        with self._preference_lock:
+            self._cancel_pending_start()
+            _LOGGER.info("[%s] → PAUSE", self.serial)
+            self._publish({"msg": "PAUSE", "mode-reason": "RAPP", "time": _now_iso()})
+            self._publish_jdm("service.set_room_clean", {
+                "ctrl_value": 2, "clean_type": 0, "room_ids": [],
+            })
+
+    def resume(self) -> None:
+        """Resume a paused clean.
+
+        The Dyson app does NOT send a general START on resume — it sends
+        only service.set_room_clean with ctrl_value: 1 and empty room_ids.
+        Sending START would start a new job from scratch; this resumes the
+        existing one.
+        """
+        _LOGGER.info("[%s] → RESUME", self.serial)
+        self._publish_jdm("service.set_room_clean", {
+            "ctrl_value": 1, "clean_type": 0, "room_ids": [],
+        })
 
     def _abort_dock_action(self) -> None:
         """Send ABORT-DOCK-ACTION before every clean start.

@@ -32,6 +32,7 @@ from .dyson_mqtt import (
     is_any_cleaning,
     is_docked,
     is_charging,
+    is_paused,
     has_fault,
     active_fault_code,
     dock_needs_maintenance,
@@ -51,6 +52,7 @@ _LOGGER = logging.getLogger(__name__)
 SUPPORTED_FEATURES = (
     VacuumEntityFeature.START
     | VacuumEntityFeature.STOP
+    | VacuumEntityFeature.PAUSE
     | VacuumEntityFeature.RETURN_HOME
     | VacuumEntityFeature.FAN_SPEED
     | VacuumEntityFeature.STATE
@@ -144,6 +146,8 @@ class DysonVacuumEntity(StateVacuumEntity):
         if has_fault(state):
             return VacuumActivity.ERROR
         robot_state = state.get("state", "")
+        if robot_state == "FULL_CLEAN_PAUSED":
+            return VacuumActivity.PAUSED
         if robot_state in RUNNING_STATES:
             return VacuumActivity.CLEANING
         if robot_state in {"RETURNING_TO_BASE", "MAPPING"}:
@@ -199,10 +203,26 @@ class DysonVacuumEntity(StateVacuumEntity):
     # ── Commands ──────────────────────────────────────────────────────────────
 
     async def async_start(self) -> None:
-        mode_int = MODE_TO_INT.get(self._coordinator.current_mode, 0)
-        await self.hass.async_add_executor_job(
-            self._coordinator.mqtt.start_mode, mode_int
-        )
+        """Start or resume cleaning.
+
+        If the robot is currently paused, sends only the JDM resume command
+        (service.set_room_clean ctrl_value:1) — the Dyson app does not send
+        a general START on resume, which would start a new job from scratch.
+        If the robot is not paused, uses the existing full start flow.
+        """
+        if is_paused(self._mqtt_state):
+            await self.hass.async_add_executor_job(
+                self._coordinator.mqtt.resume
+            )
+        else:
+            mode_int = MODE_TO_INT.get(self._coordinator.current_mode, 0)
+            await self.hass.async_add_executor_job(
+                self._coordinator.mqtt.start_mode, mode_int
+            )
+
+    async def async_pause(self) -> None:
+        """Pause an active clean."""
+        await self.hass.async_add_executor_job(self._coordinator.mqtt.pause)
 
     async def async_stop(self, **kwargs: Any) -> None:
         """Stop cleaning; also cancels any in-flight sequential room task (P1 #2)."""
