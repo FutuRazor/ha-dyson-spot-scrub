@@ -29,6 +29,12 @@ _LOGGER = logging.getLogger(__name__)
 # Reconnect backoff schedule (seconds): 15 s, 30 s, 60 s, then 120 s forever
 _RECONNECT_DELAYS = [15, 30, 60, 120]
 
+# Robot states that indicate a clean cycle has genuinely completed.
+# Deliberately excludes FULL_CLEAN_CHARGING (mid-clean recharge) and
+# WASHING_MOP / DRYING_MOP (dock cycle stages) — those are transient
+# states within a clean, not signals that the room is done.
+_CLEAN_COMPLETE_ROBOT_STATES: frozenset[str] = frozenset({"CHARGING", "INACTIVE_CHARGING"})
+
 # Minimum seconds between upstream live-map API calls (shared across all viewers)
 _LIVE_MAP_MIN_INTERVAL = 5.0
 
@@ -410,14 +416,28 @@ class DysonCoordinator:
                         "[%s] Sequential clean stopped: could not start %r", self.serial, room,
                     )
                     return
-                await self._async_wait_for_clean_complete()
+                completed = await self._async_wait_for_clean_complete()
+                if not completed:
+                    _LOGGER.warning(
+                        "[%s] Sequential clean aborted: timed out waiting for %r to dock",
+                        self.serial, room,
+                    )
+                    return
             _LOGGER.info("[%s] Sequential clean finished all rooms", self.serial)
         finally:
             self._cleaning_task = None
 
-    async def _async_wait_for_clean_complete(self, timeout: float = 3600.0) -> None:
-        """Wait until the robot returns to dock (or times out)."""
-        from .dyson_mqtt import is_docked, is_charging, is_any_cleaning
+    async def _async_wait_for_clean_complete(self, timeout: float = 3600.0) -> bool:
+        """Wait until the robot returns to dock after cleaning.
+
+        Returns True when the robot reaches a genuine completion state
+        (CHARGING or INACTIVE_CHARGING).  Returns False on timeout.
+
+        FULL_CLEAN_CHARGING and WASHING_MOP/DRYING_MOP are intentionally
+        excluded — they are transient dock-cycle stages within a single
+        clean run, not indicators that the room is finished.
+        """
+        from .dyson_mqtt import is_any_cleaning
 
         loop = asyncio.get_event_loop()
         done_event: asyncio.Event = asyncio.Event()
@@ -431,7 +451,7 @@ class DysonCoordinator:
             state = self.state  # snapshot — already on HA event loop
             if is_any_cleaning(state):
                 cleaning_started = True
-            elif cleaning_started and (is_docked(state) or is_charging(state)):
+            elif cleaning_started and state.get("state") in _CLEAN_COMPLETE_ROBOT_STATES:
                 done_event.set()
 
         class _Watcher:
@@ -442,7 +462,9 @@ class DysonCoordinator:
         self.async_add_listener(watcher)
         try:
             await asyncio.wait_for(done_event.wait(), timeout=timeout)
+            return True
         except asyncio.TimeoutError:
             _LOGGER.warning("[%s] Timed out waiting for robot to dock", self.serial)
+            return False
         finally:
             self.async_remove_listener(watcher)
