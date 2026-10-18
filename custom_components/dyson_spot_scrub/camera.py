@@ -215,7 +215,17 @@ class DysonMapCamera(Camera):
         )
         self._observe_cleaning_state()
         self._store = Store(self.hass, _STORE_VERSION, self._store_key)
-        data = await self._store.async_load()
+        try:
+            data = await self._store.async_load()
+        except Exception:  # noqa: BLE001  # e.g. UnsupportedStorageVersionError
+            _LOGGER.warning(
+                "[%s] Presentation cache storage is incompatible (version mismatch) "
+                "— starting with an empty cache; delete "
+                "/config/.storage/%s to suppress this warning. "
+                "The cache will be rebuilt on the next cleaning run.",
+                self._serial, self._store_key,
+            )
+            data = None
         if data and isinstance(data, dict):
             self._presentation_cache = data
             _LOGGER.debug(
