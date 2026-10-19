@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -27,7 +28,12 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: DysonCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([DysonBatterySensor(coordinator, entry)])
+    async_add_entities([
+        DysonBatterySensor(coordinator, entry),
+        *(DysonConsumableSensor(coordinator, entry, kind, key, name)
+          for kind, key, name in CONSUMABLES),
+        DysonCleaningSolutionSensor(coordinator, entry),
+    ])
 
 
 class DysonBatterySensor(SensorEntity):
@@ -79,3 +85,81 @@ class DysonBatterySensor(SensorEntity):
     @callback
     def async_write_ha_state(self) -> None:
         super().async_write_ha_state()
+
+
+# Stable keys are independent of entity names and user-assigned entity IDs.
+CONSUMABLES = (
+    ("brushBar", "brush_bar", "Brush bar usage"),
+    ("mopRoller", "mop_roller", "Mop roller usage"),
+    ("sideBrushes", "side_brushes", "Side brushes usage"),
+    ("robotFilter", "robot_filter", "Robot filter usage"),
+    ("dockFilter", "dock_filter", "Dock filter usage"),
+)
+
+
+def consumable_record(state: dict, kind: str) -> dict:
+    """Return one unambiguous record; missing/malformed data is unknown."""
+    records = state.get("consumables")
+    if not isinstance(records, list):
+        return {}
+    matches = [item for item in records
+               if isinstance(item, dict) and item.get("type") == kind]
+    return matches[0] if len(matches) == 1 else {}
+
+
+class DysonConsumableSensor(DysonBatterySensor):
+    """Consumed lifespan in percent, supplied by existing MQTT push updates."""
+
+    _attr_device_class = None
+    _attr_icon = "mdi:progress-wrench"
+
+    def __init__(self, coordinator, entry, kind: str, key: str, name: str) -> None:
+        super().__init__(coordinator, entry)
+        self._kind = kind
+        self._attr_name = name
+        self._attr_unique_id = f"{entry.data[CONF_SERIAL]}_consumable_{key}_usage"
+        self._attr_extra_state_attributes = {
+            "consumable_type": kind,
+            "value_kind": "usage_percent",
+        }
+
+    @property
+    def native_value(self) -> int | float | None:
+        if not self.available:
+            return None
+        value = consumable_record(self._coordinator.state, self._kind).get("usage")
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or not 0 <= value <= 100):
+            return None
+        return value
+
+
+class DysonCleaningSolutionSensor(DysonBatterySensor):
+    """Refill status; the robot does not report a liquid percentage."""
+
+    _attr_name = "Cleaning solution"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_state_class = None
+    _attr_native_unit_of_measurement = None
+    _attr_options = ["ok", "refill_required"]
+    _attr_translation_key = "cleaning_solution"
+    _attr_icon = "mdi:bottle-tonic-outline"
+    _attr_extra_state_attributes = {
+        "consumable_type": "cleaningSolution",
+        "value_kind": "refill_status",
+    }
+
+    def __init__(self, coordinator, entry) -> None:
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.data[CONF_SERIAL]}_consumable_cleaning_solution"
+
+    @property
+    def native_value(self) -> str | None:
+        if not self.available:
+            return None
+        value = consumable_record(self._coordinator.state, "cleaningSolution").get("needsRefill")
+        if value is True:
+            return "refill_required"
+        if value is False:
+            return "ok"
+        return None
