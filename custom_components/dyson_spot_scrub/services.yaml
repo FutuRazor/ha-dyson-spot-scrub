@@ -78,3 +78,17 @@ start_rooms_with_settings:
       required: false
       selector:
         object:
+
+
+cancel_drying:
+  name: Cancel drying
+  description: Cancel mop roller drying for one connected Dyson vacuum. The dock state updates when the robot confirms the change.
+  fields:
+    entity_id:
+      name: Dyson vacuum
+      description: The vacuum currently drying its mop roller.
+      required: true
+      selector:
+        entity:
+          integration: dyson_spot_scrub
+          domain: vacuum

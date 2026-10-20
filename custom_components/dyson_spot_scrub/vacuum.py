@@ -43,6 +43,7 @@ from .dyson_mqtt import (
 
 SERVICE_CLEAN_ROOM   = "clean_room"
 SERVICE_CLEAN_ROOMS  = "clean_rooms"
+SERVICE_CANCEL_DRYING = "cancel_drying"
 SERVICE_SAVE_ROOM_SETTINGS = "save_room_settings"
 SERVICE_START_ROOMS_WITH_SETTINGS = "start_rooms_with_settings"
 ATTR_ROOM            = "room"
@@ -134,6 +135,24 @@ async def async_setup_entry(
         if not coordinator.mqtt.connected:
             raise HomeAssistantError("The selected Dyson vacuum is disconnected")
         return coordinator
+
+    if not hass.services.has_service(DOMAIN, SERVICE_CANCEL_DRYING):
+
+        async def _handle_cancel_drying(call: ServiceCall) -> None:
+            coordinator = _get_target_coordinator(call)
+            if coordinator.state.get("dockState") != "DRYING_MOP":
+                raise HomeAssistantError("The selected Dyson vacuum is not drying its mop roller")
+            sent = await hass.async_add_executor_job(coordinator.mqtt.cancel_drying)
+            if not sent:
+                raise HomeAssistantError("Could not send the drying cancellation command")
+            # Do not fake IDLE or zero remaining time: wait for robot telemetry.
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_CANCEL_DRYING,
+            _handle_cancel_drying,
+            schema=vol.Schema({vol.Required(ATTR_ENTITY_ID): _CARD_ENTITY_SCHEMA}),
+        )
 
     if not hass.services.has_service(DOMAIN, SERVICE_SAVE_ROOM_SETTINGS):
 
@@ -268,6 +287,10 @@ class DysonVacuumEntity(StateVacuumEntity):
             dock_state = state.get("dockState")
             if dock_state:
                 attrs["dock_state"] = dock_state
+            if dock_state == "DRYING_MOP" and self.available:
+                for key in ("drying_total_seconds", "drying_remaining_seconds", "drying_updated_at"):
+                    if key in state:
+                        attrs[key] = state[key]
 
             # Active cleaning type (VACUUMING / MOPPING / VACUUMING_AND_MOPPING)
             full_clean_action = state.get("fullCleanAction")

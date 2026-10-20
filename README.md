@@ -206,3 +206,38 @@ MIT
 ## Consumable monitoring
 
 Five percentage sensors report used lifespan for the brush bar, mop roller, side brushes, robot filter and dock filter. A cleaning-solution sensor reports OK or Refill required. See [Consumable sensors](CONSUMABLES.md) for entity identification, card integration and testing.
+
+
+### Mop roller drying (fork build v1.4.5)
+
+While `dock_state` is `DRYING_MOP`, the vacuum exposes `drying_total_seconds`,
+`drying_remaining_seconds`, and `drying_updated_at` (UTC reception time of the
+last valid timing packet). These are robot-reported values, not a locally
+estimated countdown. Timing packets arrive roughly once per minute; missing or
+invalid packets leave the previous sample unchanged until the next valid one.
+The timestamp is not refreshed by unrelated status messages.
+
+Timing requires a confirmed drying state and a valid `work_time` type 3 packet.
+It may therefore take about a minute to appear after startup. Times are removed
+when the dock leaves drying or MQTT disconnects. No old cycle values are restored.
+A zero remaining time alone does not change the dock state. Frontends may derive
+progress as `(total - remaining) / total` and interpolate between samples using
+the timestamp, but the live dock state determines whether drying is active.
+
+To cancel drying independently of starting a clean:
+
+```yaml
+action: dyson_spot_scrub.cancel_drying
+data:
+  entity_id: vacuum.your_dyson
+```
+
+The action resolves exactly one Dyson vacuum, requires a live connection and
+active drying, and reuses the existing `ABORT-DOCK-ACTION` / `DRY_MOP` command.
+It sends no cleaning, stop or home command and does not modify room settings.
+Successful submission is not confirmation of completion: wait for `dock_state`
+to change. The existing pre-clean drying cancellation remains unchanged.
+
+Card integration contract: detect `hass.services.dyson_spot_scrub.cancel_drying`,
+then call it with the selected vacuum's `entity_id`. The planner card's existing
+Cancel drying placeholder still needs frontend wiring in a separate card update.
