@@ -72,5 +72,16 @@
         "room_settings": {"name": "Room settings", "description": "Optional select option labels to apply before starting, keyed by stable room ID."}
       }
     }
+  },
+  "entity": {
+    "sensor": {
+      "cleaning_solution": {
+        "name": "Cleaning solution",
+        "state": {
+          "ok": "OK",
+          "refill_required": "Refill required"
+        }
+      }
+    }
   }
 }

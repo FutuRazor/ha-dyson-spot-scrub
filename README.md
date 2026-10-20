@@ -202,3 +202,7 @@ Pull requests welcome. Please open an issue before starting significant work so 
 ## Licence
 
 MIT
+
+## Consumable monitoring
+
+Five percentage sensors report used lifespan for the brush bar, mop roller, side brushes, robot filter and dock filter. A cleaning-solution sensor reports OK or Refill required. See [Consumable sensors](CONSUMABLES.md) for entity identification, card integration and testing.
