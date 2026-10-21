@@ -35,6 +35,7 @@ import paho.mqtt.client as mqtt
 _LOGGER = logging.getLogger(__name__)
 
 _PREFERENCE_TIMEOUT = 10.0
+_DRYING_TIME_KEYS = ("drying_total_seconds", "drying_remaining_seconds", "drying_updated_at")
 
 _ROOM_SETTING_OPTIONS = {
     "cleaning_mode": (3, {
@@ -437,19 +438,30 @@ class DysonMqttClient:
             "ctrl_value": 1, "clean_type": 0, "room_ids": [],
         })
 
-    def _abort_dock_action(self) -> None:
+    def _abort_dock_action(self) -> bool:
         """Send ABORT-DOCK-ACTION before every clean start.
 
         The Dyson app sends this command (with action=DRY_MOP) before starting
         any clean cycle.  It kills any active drying cycle so the robot does
         not try to do two things at once.  Confirmed from MQTT captures Oct 2026.
         """
-        self._publish({
+        return self._publish({
             "msg":         "ABORT-DOCK-ACTION",
             "action":      "DRY_MOP",
             "mode-reason": "RAPP",
             "time":        _now_iso(),
         })
+
+    def cancel_drying(self) -> bool:
+        """Cancel only roller drying; telemetry confirms completion."""
+        if not self.connected or self.state.get("dockState") != "DRYING_MOP":
+            return False
+        return self._abort_dock_action()
+
+    def _clear_drying_time(self) -> None:
+        """Never carry a previous cycle's times into a new dock cycle."""
+        self.state = {key: value for key, value in self.state.items()
+                      if key not in _DRYING_TIME_KEYS}
 
     def stop(self) -> None:
         with self._preference_lock:
@@ -775,6 +787,8 @@ class DysonMqttClient:
         self._disconnected_handled = True
         _LOGGER.warning("[%s] MQTT disconnected (rc=%s)", self.serial, rc)
         self.connected = False
+        self._clear_drying_time()
+        self._notify_state_change()
         self._cancel_pending_start()
         if self.on_disconnected:
             self.on_disconnected()
@@ -860,6 +874,8 @@ class DysonMqttClient:
         msg_type = data.get("msg") or data.get("method")
         if msg_type in {"CURRENT-STATE", "STATE-CHANGE", "PRODUCT_INFO", "INITIAL_STATE"}:
             self.state = {**self.state, **data}
+            if "dockState" in data and data["dockState"] != "DRYING_MOP":
+                self._clear_drying_time()
             self._notify_state_change()
 
             if not self._preferences_fetched and self.state.get("persistentMapId"):
@@ -874,6 +890,19 @@ class DysonMqttClient:
 
     def _merge_jdm_props(self, props: dict) -> None:
         updates: dict = {}
+        work_time = props.get("work_time")
+        if isinstance(work_time, dict) and self.state.get("dockState") == "DRYING_MOP":
+            total, remaining = work_time.get("total"), work_time.get("surplus")
+            # Type 3 is confirmed for drying. Reject booleans, incomplete and
+            # invalid samples without resetting the last valid measurement.
+            if (type(work_time.get("type")) is int and work_time["type"] == 3
+                    and type(total) is int and type(remaining) is int
+                    and total > 0 and 0 <= remaining <= total):
+                updates.update({
+                    "drying_total_seconds": total,
+                    "drying_remaining_seconds": remaining,
+                    "drying_updated_at": _now_iso(),
+                })
         if "sweep_type" in props:
             updates["sweepType"] = props["sweep_type"]
         if "work_mode" in props:
