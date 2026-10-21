@@ -406,7 +406,12 @@ class DysonCoordinator:
 
     async def async_clean_rooms_sequential(self, room_names: list[str]) -> None:
         """Clean a list of rooms one at a time, waiting for docking between each."""
+        from .dyson_mqtt import start_block_reason
         if not room_names:
+            return
+        reason = start_block_reason(self.mqtt.state if self.mqtt else {}, bool(self.mqtt and self.mqtt.connected))
+        if reason:
+            _LOGGER.warning("Sequential clean blocked: %s", reason)
             return
         # P1 #2: record this task so stop/return_to_base can cancel it
         self._cleaning_task = asyncio.current_task()
@@ -441,14 +446,11 @@ class DysonCoordinator:
     async def _async_wait_for_clean_complete(self, timeout: float = 3600.0) -> bool:
         """Wait until the robot returns to dock after cleaning.
 
-        Returns True when the robot reaches a genuine completion state
-        (CHARGING or INACTIVE_CHARGING).  Returns False on timeout.
-
-        FULL_CLEAN_CHARGING and WASHING_MOP/DRYING_MOP are intentionally
-        excluded — they are transient dock-cycle stages within a single
-        clean run, not indicators that the room is finished.
+        Require both a completion state and new-job readiness. Charging alone
+        can precede the end of station work. Drying after a completed job may
+        be interrupted by the next room; mid-job charging remains blocked.
         """
-        from .dyson_mqtt import is_any_cleaning
+        from .dyson_mqtt import is_any_cleaning, start_block_reason
 
         loop = asyncio.get_event_loop()
         done_event: asyncio.Event = asyncio.Event()
@@ -462,7 +464,8 @@ class DysonCoordinator:
             state = self.state  # snapshot — already on HA event loop
             if is_any_cleaning(state):
                 cleaning_started = True
-            elif cleaning_started and state.get("state") in _CLEAN_COMPLETE_ROBOT_STATES:
+            elif (cleaning_started and state.get("state") in _CLEAN_COMPLETE_ROBOT_STATES
+                  and start_block_reason(state, self.mqtt.connected) is None):
                 done_event.set()
 
         class _Watcher:

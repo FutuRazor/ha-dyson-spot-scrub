@@ -6,11 +6,13 @@ import logging
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, CONF_SERIAL, CONF_DEVICE_NAME, CONF_PRODUCT_TYPE, MODE_TO_INT
 from .coordinator import DysonCoordinator
+from .dyson_mqtt import start_block_reason
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +59,9 @@ class DysonStartButton(ButtonEntity):
             _LOGGER.warning("Cannot start — MQTT not connected")
             return
 
+        reason = start_block_reason(self._coordinator.mqtt.state, self.available)
+        if reason:
+            raise HomeAssistantError(f"Cannot start a new clean: {reason.replace('_', ' ')}")
         enabled = self._coordinator.enabled_rooms
         if enabled:
             # Sort by map order so cleaning feels predictable

@@ -68,6 +68,41 @@ def is_running(state: dict) -> bool:
     return state.get("state") in RUNNING_STATES
 
 
+def start_block_reason(state: dict, connected: bool = True) -> str | None:
+    """Classify new-job readiness without changing activity or robot state.
+
+    October 18/21 captures show FINISHED/workMode=38 throughout the return
+    and dock preparation, including the gap before station work starts.
+    Inactive charging is ready only after blocking station work has ended.
+    This does not govern resume, pause, Home or saving preferences.
+    """
+    if not connected:
+        return "disconnected"
+    if has_fault(state):
+        return "robot_fault"
+    robot = state.get("state", "")
+    dock = state.get("dockState")
+    if not isinstance(robot, str):
+        return "waiting_for_ready_state"
+    if dock == "WASHING_MOP":
+        return "washing_mop"
+    if dock == "COLLECTING_DUST":
+        return "emptying_bin"
+    if robot == "MAPPING" or robot.startswith("MAPPING_"):
+        return "mapping_or_navigation"
+    if robot in {"RETURNING_TO_BASE", "ABORTED", "FULL_CLEAN_ABORTED"}:
+        return "returning_or_finishing"
+    if robot == "FULL_CLEAN_FINISHED" or state.get("workMode") == 38:
+        return "returning_or_finishing"
+    if robot in RUNNING_STATES or robot.startswith("FULL_CLEAN_"):
+        return "cleaning_job_active"
+    # Do not require a previous station cycle: not every job performs one.
+    if robot in {"INACTIVE_CHARGING", "INACTIVE_CHARGED", "INACTIVE_DISCHARGING", "CHARGING"}:
+        if dock in {"IDLE", "DOCKED", "DRYING_MOP"}:
+            return None
+    return "waiting_for_ready_state"
+
+
 def is_paused(state: dict) -> bool:
     """True when the robot is mid-clean but paused (FULL_CLEAN_PAUSED).
 
@@ -402,6 +437,12 @@ class DysonMqttClient:
         """Start all rooms in mode 0-3, preserving their other settings."""
         return self._start_cleaning(mode)
 
+    def _can_start_new_clean(self) -> bool:
+        reason = start_block_reason(self.state, self.connected)
+        if reason:
+            _LOGGER.warning("[%s] New cleaning start blocked: %s", self.serial, reason)
+        return reason is None
+
     def _cancel_pending_start(self) -> None:
         """Wake a pending preference read without allowing a delayed start."""
         with self._preference_lock:
@@ -616,6 +657,8 @@ class DysonMqttClient:
         try:
             with self._preference_lock:
                 self._start_cancelled = False
+                if not self._can_start_new_clean():
+                    return False
                 if not self.connected:
                     _LOGGER.warning("[%s] Cannot start: MQTT disconnected", self.serial)
                     return False
@@ -638,6 +681,9 @@ class DysonMqttClient:
 
             received = self._preference_ready.wait(_PREFERENCE_TIMEOUT)
             with self._preference_lock:
+                # A Dyson-app command may have changed readiness while we waited.
+                if not self._can_start_new_clean():
+                    return False
                 if self._start_cancelled or not self.connected:
                     _LOGGER.info("[%s] Pending cleaning start cancelled", self.serial)
                     return False
@@ -763,6 +809,11 @@ class DysonMqttClient:
             self.serial, self._endpoint, self._prefix,
         )
         self.connected = True
+        # Retain map/preferences, but never authorize a new job from a previous
+        # connection's readiness snapshot. Wait for fresh robot/dock telemetry.
+        for key in ("state", "dockState", "workMode", "jdmStatus"):
+            self.state.pop(key, None)
+        self._notify_state_change()
         self._preferences_fetched = False  # Allow re-fetch on reconnect
         # Single wildcard subscription covers every prefix (RB05, NROB, …).
         client.subscribe(f"+/{self.serial}/#", qos=0)

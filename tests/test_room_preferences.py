@@ -48,7 +48,7 @@ class RoomSettingsTests(unittest.TestCase):
             "test-serial", "RB05", "example.invalid", "token", "signature",
             "client-id", "authorizer")
         self.client.connected = True
-        self.client.state = {"persistentMapId": "123"}
+        self.client.state = {"persistentMapId": "123", "state": "INACTIVE_CHARGING", "dockState": "IDLE"}
         self.preferences = {
             "room": [
                 [12, "Flur", 0, 3, 0, 2, 0, 0, 1, 0, 1, 0],
@@ -66,6 +66,7 @@ class RoomSettingsTests(unittest.TestCase):
         self.sent.append((topic, deepcopy(payload)))
         if payload.get("method") == "service.get_preference":
             self.on_request(payload)
+        return True  # Match the transport's successful-publication contract.
 
     def reply(self, request, preferences=None, code=0, msg_id=None):
         data = {
@@ -237,11 +238,54 @@ class RoomSettingsTests(unittest.TestCase):
         hass = SimpleNamespace(async_add_executor_job=AsyncMock(return_value=False))
         coordinator = coordinator_module.DysonCoordinator(
             hass, "token", "serial", "RB05", SimpleNamespace(data={}))
-        coordinator.mqtt = SimpleNamespace(connected=True, start_room=Mock())
+        coordinator.mqtt = SimpleNamespace(connected=True, start_room=Mock(), state=dict(self.client.state))
         with patch.object(coordinator, "_async_wait_for_clean_complete", AsyncMock()) as wait:
             asyncio.run(coordinator.async_clean_rooms_sequential(["Flur", "Schlafzimmer"]))
             wait.assert_not_awaited()
         hass.async_add_executor_job.assert_awaited_once()
+
+    def test_readiness_change_during_preference_read_sends_no_writes(self):
+        def changed(request):
+            self.client.state.update(state="FULL_CLEAN_FINISHED", workMode=38)
+            self.reply(request)
+        self.on_request = changed
+        self.assertFalse(self.client.start_room("Flur", 0))
+        self.assertEqual([p.get("method") for _, p in self.sent], ["service.get_preference"])
+
+    def test_start_during_confirmed_drying_keeps_existing_start_sequence(self):
+        self.client.state.update(dockState="DRYING_MOP", workMode=0)
+        self.assertTrue(self.client.start_room("Flur", 0))
+        commands = [p.get("method", p.get("msg")) for _, p in self.sent]
+        self.assertIn("ABORT-DOCK-ACTION", commands)
+        self.assertIn("START", commands)
+        self.assertLess(commands.index("ABORT-DOCK-ACTION"), commands.index("START"))
+
+    def test_sequence_waits_for_station_work_after_charging(self):
+        coordinator_module = importlib.import_module("room_test_integration.coordinator")
+        async def run():
+            coordinator = coordinator_module.DysonCoordinator(
+                SimpleNamespace(), "token", "serial", "RB05", SimpleNamespace(data={}))
+            coordinator.mqtt = self.client
+            watchers = []
+            coordinator.async_add_listener = watchers.append
+            coordinator.async_remove_listener = watchers.remove
+            wait = asyncio.create_task(coordinator._async_wait_for_clean_complete(timeout=1))
+            await asyncio.sleep(0)
+            for snapshot in [
+                {"state":"FULL_CLEAN_RUNNING", "fullCleanAction":"VACUUMING", "dockState":"IDLE"},
+                {"state":"FULL_CLEAN_FINISHED", "dockState":"IDLE", "workMode":38},
+                {"state":"INACTIVE_CHARGING", "dockState":"COLLECTING_DUST", "workMode":0},
+            ]:
+                coordinator._state_snapshot = snapshot
+                watchers[0].async_write_ha_state()
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                self.assertFalse(wait.done())
+            coordinator._state_snapshot = {"state":"INACTIVE_CHARGING", "dockState":"IDLE", "workMode":0}
+            watchers[0].async_write_ha_state()
+            self.assertTrue(await wait)
+            self.assertEqual(watchers, [])
+        asyncio.run(run())
 
 
 if __name__ == "__main__":
