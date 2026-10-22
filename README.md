@@ -17,6 +17,14 @@ A custom Home Assistant integration for the **Dyson Spot+Scrub AI** robot vacuum
 | Fault | `binary_sensor` | On when robot has reported an error |
 | Zone switches | `switch` | One per mapped room — enable or disable individual zones |
 
+### New cleaning start readiness
+
+New cleaning jobs are rejected while the robot is cleaning or paused, returning/finishing, mapping, washing its roller or emptying its bin. In particular, `FULL_CLEAN_FINISHED` does not mean ready: the robot may still be returning or preparing station work. Confirmed inactive states with an idle dock allow starting without requiring a preceding station cycle. Confirmed post-clean drying remains interruptible by the existing start sequence.
+
+The vacuum exposes `ready_to_start` (boolean) and `start_block_reason` (reason code, or `null` when ready). Dashboard cards can use these attributes to disable Start and explain why. Enforcement also applies to the integration's start button, room actions and MQTT start path, independently of dashboard support. `vacuum.start` still resumes a paused clean; a different/new room job is blocked while paused. A fan-speed command that would restart an active job is now rejected; selecting preferences without starting is unchanged.
+
+See [start readiness and testing](START_READINESS.md) for the state contract, evidence and limitations.
+
 ### Floor Map
 
 The Floor Map camera entity renders a live PNG showing:

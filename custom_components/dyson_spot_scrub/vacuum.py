@@ -39,6 +39,7 @@ from .dyson_mqtt import (
     active_fault_code,
     dock_needs_maintenance,
     RUNNING_STATES,
+    start_block_reason,
 )
 
 SERVICE_CLEAN_ROOM   = "clean_room"
@@ -67,6 +68,14 @@ _START_ROOMS_WITH_SETTINGS_SCHEMA = vol.Schema({
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def _require_start_ready(coordinator: DysonCoordinator) -> None:
+    """Reject new jobs before changing preferences or scheduling room work."""
+    mqtt = coordinator.mqtt
+    reason = start_block_reason(mqtt.state if mqtt else {}, bool(mqtt and mqtt.connected))
+    if reason:
+        raise HomeAssistantError(f"Cannot start a new clean: {reason.replace('_', ' ')}")
+
 SUPPORTED_FEATURES = (
     VacuumEntityFeature.START
     | VacuumEntityFeature.STOP
@@ -92,6 +101,7 @@ async def async_setup_entry(
             room = call.data[ATTR_ROOM]
             for coord in hass.data.get(DOMAIN, {}).values():
                 if isinstance(coord, DysonCoordinator) and coord.mqtt and coord.mqtt.connected:
+                    _require_start_ready(coord)
                     await hass.async_add_executor_job(coord.mqtt.start_room, room)
 
         hass.services.async_register(
@@ -107,6 +117,7 @@ async def async_setup_entry(
             rooms = call.data[ATTR_ROOMS]
             for coord in hass.data.get(DOMAIN, {}).values():
                 if isinstance(coord, DysonCoordinator) and coord.mqtt and coord.mqtt.connected:
+                    _require_start_ready(coord)
                     hass.async_create_task(coord.async_clean_rooms_sequential(rooms))
 
         hass.services.async_register(
@@ -177,6 +188,7 @@ async def async_setup_entry(
 
         async def _handle_start_rooms_with_settings(call: ServiceCall) -> None:
             coordinator = _get_target_coordinator(call)
+            _require_start_ready(coordinator)
             started = await hass.async_add_executor_job(
                 coordinator.mqtt.start_rooms_with_settings,
                 call.data[ATTR_ROOM_IDS],
@@ -264,7 +276,11 @@ class DysonVacuumEntity(StateVacuumEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Expose room names and fault diagnostics for automations."""
-        attrs: dict[str, Any] = {}
+        reason = start_block_reason(self._mqtt_state, self.available)
+        attrs: dict[str, Any] = {
+            "ready_to_start": reason is None,
+            "start_block_reason": reason,
+        }
         if self._coordinator.mqtt:
             state = self._coordinator.state
 
@@ -314,6 +330,7 @@ class DysonVacuumEntity(StateVacuumEntity):
                 self._coordinator.mqtt.resume
             )
         else:
+            _require_start_ready(self._coordinator)
             mode_int = MODE_TO_INT.get(self._coordinator.current_mode, 0)
             await self.hass.async_add_executor_job(
                 self._coordinator.mqtt.start_mode, mode_int
@@ -336,6 +353,9 @@ class DysonVacuumEntity(StateVacuumEntity):
         if fan_speed not in CLEANING_MODES:
             _LOGGER.warning("Unknown fan speed/mode: %s", fan_speed)
             return
+        if is_any_cleaning(self._mqtt_state):
+            # The existing mode-switch path starts a new job, not a resume.
+            _require_start_ready(self._coordinator)
         self._coordinator.current_mode = fan_speed
         self._coordinator._async_notify_listeners()
 

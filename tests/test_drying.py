@@ -140,6 +140,61 @@ class DryingTests(unittest.TestCase):
         with self.assertRaises(RuntimeError): self.call_cancel()
         self.assertEqual(self.client.state['dockState'],'DRYING_MOP')
 
+    def test_readiness_replays_vacuum_and_mop_completion(self):
+        # Sanitized Oct 21 vacuum and Oct 18 mop transitions; no live robot.
+        for dock_end in ['COLLECTING_DUST', 'WASHING_MOP']:
+            samples = [
+                ({'state':'FULL_CLEAN_RUNNING','dockState':'IDLE','workMode':36}, False),
+                ({'state':'FULL_CLEAN_FINISHED','dockState':'IDLE','workMode':38,'jdmStatus':3}, False),
+                ({'state':'FULL_CLEAN_FINISHED','dockState':'IDLE','workMode':38,'jdmStatus':4}, False),
+                ({'state':'FULL_CLEAN_FINISHED','dockState':dock_end,'workMode':38}, False),
+                ({'state':'INACTIVE_CHARGING','dockState':dock_end,'workMode':0}, False),
+                ({'state':'INACTIVE_CHARGING','dockState':'DRYING_MOP' if dock_end == 'WASHING_MOP' else 'IDLE','workMode':0}, True),
+            ]
+            for state, ready in samples:
+                with self.subTest(state=state):
+                    self.client.state = self.coord.state = state
+                    attrs = self.entities[0].extra_state_attributes
+                    self.assertEqual(attrs['ready_to_start'], ready)
+                    self.assertEqual(attrs['start_block_reason'] is None, ready)
+                    if not ready:
+                        with self.assertRaises(RuntimeError):
+                            asyncio.run(self.services['start_rooms_with_settings'](SimpleNamespace(data={
+                                'entity_id':['vacuum.dyson'], 'room_ids':['12'], 'room_settings':{}})))
+                        self.assertFalse(self.client.start_mode(0))
+                        self.assertFalse(self.client.start_room('Room'))
+                        self.assertFalse(self.client.start_rooms_with_settings(['12']))
+            self.sent.assert_not_called()
+
+    def test_unknown_active_mapping_and_disconnected_are_not_ready(self):
+        for robot in ['', 'FULL_CLEAN_PAUSED', 'FULL_CLEAN_CHARGING', 'MAPPING',
+                      'MAPPING_RUNNING', 'MAPPING_CHARGING', 'MAPPING_FINISHED',
+                      'RETURNING_TO_BASE', 'ABORTED']:
+            self.assertIsNotNone(self.mqtt.start_block_reason({'state':robot,'dockState':'IDLE'}))
+        ready = {'state':'INACTIVE_CHARGING','dockState':'IDLE'}
+        self.assertIsNone(self.mqtt.start_block_reason(ready))
+        self.assertIsNotNone(self.mqtt.start_block_reason(ready, False))
+        self.assertIsNotNone(self.mqtt.start_block_reason({**ready, 'workMode':38}))
+        self.assertIsNotNone(self.mqtt.start_block_reason({**ready, 'activeFaults':[{'faultCode':'581','nextActionRequired':'USER'}]}))
+
+    def test_resume_bypasses_new_job_guard(self):
+        self.client.state = self.coord.state = {'state':'FULL_CLEAN_PAUSED','dockState':'IDLE'}
+        self.entities[0].hass = self.hass
+        with patch.object(self.client, 'resume') as resume, patch.object(self.client, 'start_mode') as start:
+            asyncio.run(self.entities[0].async_start())
+            resume.assert_called_once()
+            start.assert_not_called()
+
+    def test_reconnect_does_not_reuse_old_ready_state(self):
+        self.client.state = {'state':'INACTIVE_CHARGING','dockState':'IDLE',
+                             'workMode':0,'jdmStatus':4,'persistentMapId':'123'}
+        with patch.object(self.client, '_probe_map_id'), patch.object(self.mqtt.threading, 'Timer'):
+            self.client._on_connect(Mock(), None, None, 0)
+        self.assertEqual(self.client.state['persistentMapId'], '123')
+        self.assertEqual(self.mqtt.start_block_reason(self.client.state), 'waiting_for_ready_state')
+        self.client._handle_status({'msg':'CURRENT-STATE','state':'INACTIVE_CHARGING','dockState':'IDLE'})
+        self.assertIsNone(self.mqtt.start_block_reason(self.client.state))
+
 
 if __name__ == '__main__':
     unittest.main()
