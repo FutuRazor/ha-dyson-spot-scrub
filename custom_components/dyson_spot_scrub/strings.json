@@ -83,5 +83,68 @@
         }
       }
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Map settings",
+        "description": "Changes apply on the next camera refresh, including while the last cleaning map is retained.",
+        "data": {
+          "map_retention_minutes": "Retention time",
+          "map_keep_last": "Keep last cleaning map",
+          "map_transparent_background": "Transparent background"
+        },
+        "data_description": {
+          "map_retention_minutes": "Time after cleaning finishes or is cancelled. Set to 0 to disable timed retention. Pauses and transitions between vacuuming and mopping keep the map without starting this timer.",
+          "map_keep_last": "Keep the last cleaning map until a new cleaning starts, the map changes, or the integration restarts. Overrides retention time. When switched off, time is counted from the original end of cleaning.",
+          "map_transparent_background": "Remove the map background for use over a floorplan."
+        },
+        "sections": {
+          "line_settings_section": {
+            "name": "Appearance",
+            "data": {
+              "map_vacuum_color": "Vacuum path color",
+              "map_mop_color": "Mop path color",
+              "map_combined_color": "Vacuum and mop path color",
+              "map_path_width": "Path width",
+              "map_glow_width": "Glow width"
+            },
+            "data_description": {
+              "map_combined_color": "Used for simultaneous vacuuming and mopping. Sequential cleaning keeps separate vacuum and mop colors.",
+              "map_path_width": "Line width in source-image pixels. Dashboard scaling affects its displayed size.",
+              "map_glow_width": "Total width of the translucent line behind the cleaning path. Set a value greater than Path width for a visible glow. Set 0 to disable."
+            }
+          },
+          "visibility_settings_section": {
+            "name": "Visible elements",
+            "description": "Enabled elements are visible. Hidden elements still contribute to image bounds, preserving the overlay alignment.",
+            "data": {
+              "map_show_furniture": "Show furniture",
+              "map_show_room_names": "Show room names",
+              "map_show_room_areas": "Show room areas (m²)",
+              "map_show_legend": "Show legend",
+              "map_show_status_areas": "Show cleaning status areas",
+              "map_show_perimeter": "Show room perimeter paths",
+              "map_show_visited_paths": "Show historical room paths",
+              "map_show_grid": "Show grid",
+              "map_show_dock": "Show charging station",
+              "map_show_restrictions": "Show keep-out zones",
+              "map_show_waypoints": "Show path waypoints"
+            },
+            "data_description": {
+              "map_show_status_areas": "Colored room fills indicating cleaning progress.",
+              "map_show_perimeter": "Room-edge segments from the Dyson map. These are separate from the live cleaning path.",
+              "map_show_visited_paths": "Additional room tracks provided by Dyson. These may also trace room boundaries.",
+              "map_show_grid": "Includes distance labels and the map origin marker.",
+              "map_show_waypoints": "Dots along the cleaning path. The robot position remains visible.",
+              "map_show_legend": "The legend has its own room labels, independent of Show room names."
+            }
+          }
+        }
+      }
+    },
+    "error": {
+      "invalid_map_option": "Enter a valid value within the allowed range."
+    }
   }
 }

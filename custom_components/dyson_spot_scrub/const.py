@@ -1,6 +1,48 @@
 """Constants for the Dyson Spot+Scrub AI integration."""
 
 DOMAIN = "dyson_spot_scrub"
+
+# Display defaults preserve the current map, except for mode-specific paths.
+MAP_RETENTION_DEFAULTS = {
+    "map_retention_minutes": 5,
+    "map_keep_last": False,
+}
+MAP_APPEARANCE_DEFAULTS = {
+    "map_vacuum_color": [250, 204, 21],
+    "map_mop_color": [34, 211, 238],
+    "map_combined_color": [192, 132, 252],
+    "map_path_width": 3,
+    "map_glow_width": 6,
+}
+MAP_VISIBILITY_DEFAULTS = {
+    "map_show_furniture": True,
+    "map_show_room_names": True,
+    "map_show_room_areas": True,
+    "map_show_legend": False,
+    "map_show_status_areas": False,
+    "map_show_perimeter": True,
+    "map_show_visited_paths": True,
+    "map_show_grid": False,
+    "map_show_dock": True,
+    "map_show_restrictions": True,
+    "map_show_waypoints": True,
+}
+MAP_DEFAULTS = {
+    **MAP_RETENTION_DEFAULTS,
+    "map_transparent_background": False,
+    **MAP_APPEARANCE_DEFAULTS,
+    **MAP_VISIBILITY_DEFAULTS,
+}
+MAP_NUMBER_RANGES = {
+    "map_retention_minutes": (0, 60),
+    "map_path_width": (1, 15),
+    "map_glow_width": (0, 25),
+}
+MAP_PATH_ACTIONS = {
+    "VACUUMING": "map_vacuum_color",
+    "MOPPING": "map_mop_color",
+    "VACUUMING_AND_MOPPING": "map_combined_color",
+}
 PLATFORMS = ["vacuum", "binary_sensor", "sensor", "select", "button", "switch", "camera"]
 
 # Config entry keys

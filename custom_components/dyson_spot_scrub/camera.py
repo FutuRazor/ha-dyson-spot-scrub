@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from copy import deepcopy
+from functools import partial
 from typing import Any
 
 from homeassistant.components.camera import Camera
@@ -34,6 +36,8 @@ from .coordinator import DysonCoordinator
 from .dyson_api import get_current_map, get_map_metadata, DysonApiError
 from .dyson_mqtt import RUNNING_STATES, is_any_cleaning
 from .map_renderer import render_map
+from .map_options import map_options
+from .map_path import PathHistory
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,9 +55,6 @@ _STATIC_CACHE_ERROR_BACKOFF = 30.0  # seconds
 
 # HA storage for zone presentation persistence
 _STORE_VERSION = 1
-
-_RETENTION_SECONDS = 5 * 60
-
 
 class _CleaningStateListener:
     """Observe coordinator notifications even when nobody is viewing the camera."""
@@ -97,6 +98,8 @@ class DysonMapCamera(Camera):
     def __init__(self, coordinator: DysonCoordinator, entry: ConfigEntry) -> None:
         super().__init__()
         self._coordinator = coordinator
+        self._config_entry = entry
+        self._render_options = map_options(entry.options)
         self._token       = entry.data[CONF_AUTH_TOKEN]
         serial            = entry.data[CONF_SERIAL]
         self._serial      = serial
@@ -136,16 +139,26 @@ class DysonMapCamera(Camera):
         self._map_id: str | None = None
         self._image_lock = asyncio.Lock()
         self._cleaning_listener = _CleaningStateListener(self)
+        self._last_source: tuple | None = None
+        self._last_image_options: dict | None = None
+        self._path_history = PathHistory()
+        self._observed_action: str | None = None
+        self._action_changed_at = 0.0
 
     @property
     def _retention_seconds(self) -> float:
-        """Retention policy; a later options flow can supply this duration."""
-        return _RETENTION_SECONDS
+        """Keep-last overrides the timed policy; zero disables timed retention."""
+        if self._render_options["map_keep_last"]:
+            return float("inf")
+        return self._render_options["map_retention_minutes"] * 60
 
     def _reset_cleaning_image(self, reason: str) -> None:
         self._cleaning_generation += 1
         self._last_cleaning_image = None
         self._last_image = None
+        self._last_source = None
+        self._last_image_options = None
+        self._path_history = PathHistory()
         self._cleaning_finished_at = None
         _LOGGER.debug("[%s] Cleaning image reset: %s", self._serial, reason)
 
@@ -154,6 +167,10 @@ class DysonMapCamera(Camera):
         if mqtt is None or not mqtt.connected:
             return  # A disconnect is not the end of a cleaning.
         state = dict(mqtt.state)
+        action = state.get("fullCleanAction")
+        if action != self._observed_action:
+            self._observed_action = action
+            self._action_changed_at = time.monotonic()
         map_id = state.get("persistentMapId")
         if map_id is not None:
             map_id = str(map_id)
@@ -209,6 +226,9 @@ class DysonMapCamera(Camera):
     async def async_added_to_hass(self) -> None:
         """Called when the entity is added — load persisted presentation cache."""
         await super().async_added_to_hass()
+        self.async_on_remove(
+            self._config_entry.add_update_listener(self._async_options_updated)
+        )
         self._coordinator.async_add_listener(self._cleaning_listener)
         self.async_on_remove(
             lambda: self._coordinator.async_remove_listener(self._cleaning_listener)
@@ -237,6 +257,45 @@ class DysonMapCamera(Camera):
         self._reset_cleaning_image("entity unloaded")
         self._cleaning_active = False
         await super().async_will_remove_from_hass()
+
+    async def _async_options_updated(self, hass, entry) -> None:
+        """Apply options without reloading MQTT or losing the retained source."""
+        self._render_options = map_options(entry.options)
+        self.async_write_ha_state()
+
+    async def _render_source(self, source: tuple) -> tuple[bytes, dict]:
+        """Render a stable option snapshot; changes during rendering retry locally."""
+        while True:
+            options = self._render_options
+            image = await self.hass.async_add_executor_job(
+                partial(render_map, raise_errors=True), *source, options
+            )
+            if options == self._render_options:
+                return image, options
+
+    async def _repaint_cached_image(self) -> None:
+        """Repaint a retained/error-fallback frame without a cloud request.
+
+        Called under the image lock. Session generation prevents a late repaint
+        from restoring an image after a new cleaning, map change or expiry.
+        """
+        source = self._last_source
+        if source is None or self._last_image_options == self._render_options:
+            return
+        generation = self._cleaning_generation
+        cleaning_image = self._last_cleaning_image
+        try:
+            image, options = await self._render_source(source)
+        except Exception as exc:
+            _LOGGER.warning("[%s] Map options repaint failed: %s", self._serial, exc)
+            return
+        self._observe_cleaning_state()
+        self._retained_image()  # Expire before accepting an in-flight repaint.
+        if generation != self._cleaning_generation:
+            return
+        self._last_image, self._last_image_options = image, options
+        if cleaning_image is not None:
+            self._last_cleaning_image = image
 
     @property
     def available(self) -> bool:
@@ -269,6 +328,8 @@ class DysonMapCamera(Camera):
 
     async def _async_camera_image(self) -> bytes | None:
         self._observe_cleaning_state()
+        self._retained_image()
+        await self._repaint_cached_image()
         if (retained := self._retained_image()) is not None:
             return retained
         generation = self._cleaning_generation
@@ -300,6 +361,7 @@ class DysonMapCamera(Camera):
         # ── Fetch live data if cleaning ───────────────────────────────────────
         live_data: dict[str, Any] | None = None
         cleaning = self._fetch_live_map()
+        action = self._observed_action
         if cleaning:
             live_data = await self._coordinator.async_get_live_map()
 
@@ -318,6 +380,14 @@ class DysonMapCamera(Camera):
         # return the last known good frame rather than rendering a pathless image.
         if cleaning and live_data is None and self._last_image is not None:
             return self._last_image
+
+        if has_path:
+            # A cached snapshot predating the action change, or a response
+            # spanning a change, must not be assigned the new action blindly.
+            if (action != self._observed_action
+                    or self._coordinator._live_map_fetched_at < self._action_changed_at):
+                action = None
+            live_data = self._path_history.annotate(live_data, action)
 
         # ── Update presentation cache from fresh zone data ────────────────────
         # Prefer live_data (most up-to-date), fall back to static map.
@@ -371,17 +441,15 @@ class DysonMapCamera(Camera):
         if generation != self._cleaning_generation or retained is not None:
             return retained or self._last_image
         try:
-            image_bytes: bytes = await self.hass.async_add_executor_job(
-                render_map,
-                patched_map,
-                self._metadata,
-                live_data,
-            )
+            source = deepcopy((patched_map, self._metadata, live_data))
+            image_bytes, options = await self._render_source(source)
             self._observe_cleaning_state()
             retained = self._retained_image()
             if generation != self._cleaning_generation or retained is not None:
                 return retained or self._last_image
             self._last_image = image_bytes
+            self._last_source = source
+            self._last_image_options = options
             if has_path and image_bytes:
                 self._last_cleaning_image = image_bytes
             return image_bytes
