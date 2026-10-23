@@ -30,6 +30,9 @@ class Camera:
     def async_on_remove(self, fn):
         self.remove_callbacks.append(fn)
 
+    def async_write_ha_state(self):
+        pass
+
     async def async_will_remove_from_hass(self):
         for fn in self.remove_callbacks:
             fn()
@@ -43,6 +46,12 @@ class Store:
 
 class ApiError(Exception):
     pass
+
+
+class RateLimitError(ApiError):
+    def __init__(self, retry_after):
+        super().__init__('HTTP 429')
+        self.retry_after = retry_after
 
 
 module('homeassistant')
@@ -61,7 +70,7 @@ package = module('retention_integration')
 package.__path__ = [str(Path(__file__).resolve().parents[1] /
                         'custom_components/dyson_spot_scrub')]
 module('retention_integration.dyson_api', DysonApiError=ApiError,
-       DysonRateLimitError=ApiError,
+       DysonRateLimitError=RateLimitError,
        get_current_map=AsyncMock(), get_map_metadata=AsyncMock(),
        get_live_map=AsyncMock(), get_iot_credentials=AsyncMock())
 camera_module = importlib.import_module('retention_integration.camera')
@@ -81,16 +90,19 @@ class RetentionTests(unittest.IsolatedAsyncioTestCase):
             coordinator_module, 'get_live_map', AsyncMock(side_effect=lambda *args: self.path)))
         self.rendered = []
 
-        def render(map_data, metadata, live):
-            self.rendered.append(live)
-            return repr(live).encode() if live else b'static'
+        def render(map_data, metadata, live, options=None, **kwargs):
+            # Original retention assertions focus on API data, not path metadata.
+            original = {k: v for k, v in live.items() if k != '_pathModes'} if live else live
+            self.rendered.append(original)
+            return repr(original).encode() if original else b'static'
 
         self.enterContext(patch.object(camera_module, 'render_map', render))
         async def executor(fn, *args):
             return fn(*args)
         self.hass = SimpleNamespace(async_add_executor_job=executor)
         self.entry = SimpleNamespace(data={
-            'auth_token': 'test', 'serial': 'test', 'device_name': 'Dyson'}, options={})
+            'auth_token': 'test', 'serial': 'test', 'device_name': 'Dyson'}, options={},
+            add_update_listener=lambda fn: lambda: None)
         self.coordinator = coordinator_module.DysonCoordinator(
             self.hass, 'test', 'test', 'NROB', self.entry)
         self.coordinator.mqtt = SimpleNamespace(connected=True, state={})
@@ -182,7 +194,7 @@ class RetentionTests(unittest.IsolatedAsyncioTestCase):
     async def test_429_preserved_and_no_requests_during_retention(self):
         image = await self.start()
         self.now += 5
-        self.fetch.side_effect = ApiError('Retry-After 30 HTTP 429')
+        self.fetch.side_effect = RateLimitError(30)
         self.assertEqual(await self.camera.async_camera_image(), image)
         deadline = self.coordinator._live_map_backoff_until
         self.state('FULL_CLEAN_FINISHED')
@@ -300,6 +312,104 @@ class RetentionTests(unittest.IsolatedAsyncioTestCase):
         self.now += 300
         await self.camera.async_camera_image()
         self.assertEqual(self.camera._presentation_cache, {'1': segments})
+
+    async def options(self, **values):
+        self.entry.options.update(values)
+        await self.camera._async_options_updated(self.hass, self.entry)
+
+    async def test_zero_retention_still_holds_pause_but_not_finished(self):
+        await self.options(map_retention_minutes=0)
+        image = await self.start()
+        self.state('FULL_CLEAN_PAUSED')
+        self.now += 500
+        self.assertEqual(await self.camera.async_camera_image(), image)
+        self.state('FULL_CLEAN_FINISHED')
+        self.assertEqual(await self.camera.async_camera_image(), b'static')
+
+    async def test_keep_last_uses_original_end_time_when_disabled(self):
+        await self.options(map_keep_last=True)
+        image = await self.start()
+        self.state('FULL_CLEAN_FINISHED')
+        self.now += 4000
+        self.assertEqual(await self.camera.async_camera_image(), image)
+        await self.options(map_keep_last=False)
+        self.assertEqual(await self.camera.async_camera_image(), b'static')
+        self.assertEqual(self.fetch.await_count, 1)
+
+    async def test_configurable_sixty_minutes_and_new_clean_reset(self):
+        await self.options(map_retention_minutes=60)
+        image = await self.start()
+        self.state('FULL_CLEAN_FINISHED')
+        self.now += 3599
+        self.assertEqual(await self.camera.async_camera_image(), image)
+        self.now += 1
+        self.assertEqual(await self.camera.async_camera_image(), b'static')
+        await self.options(map_keep_last=True)
+        await self.start()
+        self.state('FULL_CLEAN_FINISHED')
+        self.state('FULL_CLEAN_DISCOVERING')
+        self.assertIsNone(self.camera._last_source)
+        self.assertEqual(self.camera._path_history.coords, [])
+
+    async def test_repaint_retained_data_without_fetch_and_retry_changed_options(self):
+        def render(map_data, metadata, live, options=None, **kwargs):
+            return str(options['map_path_width']).encode()
+        with patch.object(camera_module, 'render_map', render):
+            self.assertEqual(await self.start(), b'3')
+            self.state('FULL_CLEAN_FINISHED')
+            await self.options(map_path_width=8)
+            self.assertEqual(await self.camera.async_camera_image(), b'8')
+            self.assertEqual(self.fetch.await_count, 1)
+            self.assertEqual(self.camera._last_cleaning_image, b'8')
+            # Options change while the executor is working: only newest wins.
+            await self.options(map_path_width=9)
+            changed = False
+            async def executor(fn, *args):
+                nonlocal changed
+                result = fn(*args)
+                if not changed:
+                    changed = True
+                    await self.options(map_path_width=10)
+                return result
+            self.hass.async_add_executor_job = executor
+            self.assertEqual(await self.camera.async_camera_image(), b'10')
+            self.assertEqual(self.fetch.await_count, 1)
+
+    async def test_repaint_during_api_error_uses_cached_source(self):
+        with patch.object(camera_module, 'render_map',
+                          side_effect=lambda m, md, live, opts, **kw: str(opts['map_glow_width']).encode()):
+            self.assertEqual(await self.start(), b'6')
+            self.now += 5
+            self.fetch.side_effect = RateLimitError(30)
+            await self.options(map_glow_width=0)
+            self.assertEqual(await self.camera.async_camera_image(), b'0')
+            self.assertEqual(self.camera._last_cleaning_image, b'0')
+
+    async def test_late_repaint_cannot_restore_previous_session(self):
+        await self.start()
+        self.state('FULL_CLEAN_FINISHED')
+        await self.options(map_path_width=8)
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def delayed(fn, *args):
+            entered.set()
+            await release.wait()
+            return fn(*args)
+        self.hass.async_add_executor_job = delayed
+        task = asyncio.create_task(self.camera.async_camera_image())
+        await entered.wait()
+        self.state('FULL_CLEAN_DISCOVERING')
+        release.set()
+        await task
+        self.assertIsNone(self.camera._last_cleaning_image)
+
+    async def test_path_colors_preserve_vacuum_prefix_without_mutating_api_cache(self):
+        await self.start()
+        self.state('FULL_CLEAN_RUNNING', 'MOPPING')
+        self.now += 5
+        self.path = {'cleanPath': [[1, 1], [2, 2], [3, 3]]}
+        await self.camera.async_camera_image()
+        self.assertEqual(self.camera._last_source[2]['_pathModes'], ['VACUUMING', 'MOPPING'])
+        self.assertNotIn('_pathModes', self.coordinator._live_map_cache)
 
     async def test_real_png_renderer_and_retention(self):
         import io

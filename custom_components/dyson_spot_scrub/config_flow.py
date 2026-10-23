@@ -8,7 +8,9 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.data_entry_flow import FlowResult
+from homeassistant.core import callback
+from homeassistant.data_entry_flow import FlowResult, section
+from homeassistant.helpers import selector
 
 from .const import (
     DOMAIN,
@@ -20,7 +22,12 @@ from .const import (
     CONF_COUNTRY,
     CONF_CACHED_ROOMS,
     ROBOT_PRODUCT_PREFIXES,
+    MAP_RETENTION_DEFAULTS,
+    MAP_APPEARANCE_DEFAULTS,
+    MAP_VISIBILITY_DEFAULTS,
+    MAP_NUMBER_RANGES,
 )
+from .map_options import map_options
 from .dyson_api import (
     authenticate_v1,
     initiate_v3_auth,
@@ -80,6 +87,12 @@ class DysonConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Dyson Spot+Scrub AI."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry):
+        """Home Assistant supplies the entry through OptionsFlow.config_entry."""
+        return DysonOptionsFlow()
 
     def __init__(self) -> None:
         self._token:        str = ""
@@ -314,3 +327,77 @@ class DysonConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_CACHED_ROOMS: [],
             },
         )
+
+
+class DysonOptionsFlow(config_entries.OptionsFlow):
+    """Single map-settings form, with flat storage for existing camera options."""
+
+    async def async_step_init(self, user_input=None) -> FlowResult:
+        values = map_options(self.config_entry.options)
+        top_defaults = {
+            **MAP_RETENTION_DEFAULTS,
+            "map_transparent_background": False,
+        }
+        groups = {
+            "line_settings_section": MAP_APPEARANCE_DEFAULTS,
+            "visibility_settings_section": {
+                key: value for key, value in MAP_VISIBILITY_DEFAULTS.items()
+                if key != "map_transparent_background"
+            },
+        }
+        errors = {}
+        invalid_groups = set()
+        if user_input is not None:
+            submitted = {key: user_input[key] for key in top_defaults if key in user_input}
+            for name, defaults in groups.items():
+                group_input = user_input.get(name, {})
+                if not isinstance(group_input, dict):
+                    errors["base"] = "invalid_map_option"
+                    invalid_groups.add(name)
+                    continue
+                submitted.update({key: group_input[key] for key in defaults if key in group_input})
+            validated = map_options({**values, **submitted})
+            for key, value in submitted.items():
+                if (validated[key] != value
+                        or isinstance(values[key], bool) and not isinstance(value, bool)
+                        or key in MAP_NUMBER_RANGES and isinstance(value, bool)):
+                    errors["base"] = "invalid_map_option"
+                    invalid_groups.update(name for name, defaults in groups.items() if key in defaults)
+            if not errors:
+                # Section nesting is only a UI concern. Keep existing option keys
+                # flat so the camera and older saved settings remain compatible.
+                options = dict(self.config_entry.options)
+                options.update({key: validated[key] for key in submitted})
+                return self.async_create_entry(title="", data=options)
+            values.update(submitted)
+
+        fields = self._fields(top_defaults, values)
+        for name, defaults in groups.items():
+            # A section default takes precedence over its children's defaults
+            # in the frontend. An empty dict leaves every child uninitialized.
+            fields[vol.Optional(name, default={key: values[key] for key in defaults})] = section(
+                vol.Schema(self._fields(defaults, values)),
+                {"collapsed": name not in invalid_groups},
+            )
+        return self.async_show_form(
+            step_id="init", data_schema=vol.Schema(fields), errors=errors,
+        )
+
+    @staticmethod
+    def _fields(defaults, values):
+        fields = {}
+        for key, default in defaults.items():
+            if isinstance(default, bool):
+                field = selector.BooleanSelector()
+            elif key in MAP_NUMBER_RANGES:
+                minimum, maximum = MAP_NUMBER_RANGES[key]
+                field = selector.NumberSelector(selector.NumberSelectorConfig(
+                    min=minimum, max=maximum, step=1,
+                    mode=selector.NumberSelectorMode.SLIDER,
+                    unit_of_measurement="min" if key == "map_retention_minutes" else "px",
+                ))
+            else:
+                field = selector.ColorRGBSelector()
+            marker = vol.Optional if isinstance(default, bool) else vol.Required
+            fields[marker(key, default=values[key])] = field
+        return fields

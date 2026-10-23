@@ -29,6 +29,9 @@ import io
 import math
 from typing import Any
 
+from .const import MAP_PATH_ACTIONS
+from .map_options import map_options
+
 try:
     from PIL import Image, ImageDraw, ImageFont
     _PIL_AVAILABLE = True
@@ -49,7 +52,7 @@ DOCK           = (52,  211, 153, 255)   # #34d399 emerald green
 ROBOT          = (245, 158, 11,  255)   # #f59e0b amber
 ROBOT_HALO     = (245, 158, 11,  50)
 PATH_MAIN      = (34,  211, 238, 255)   # #22d3ee cyan
-PATH_GLOW      = (34,  211, 238, 50)
+PATH_UNKNOWN   = (160, 160, 168, 255)
 KEEPOUT_FILL   = (245, 158, 11,  35)    # amber tint
 KEEPOUT_STROKE = (245, 158, 11,  220)   # amber
 FURN_FILL      = (55,  60,  70,  255)   # dark grey
@@ -68,6 +71,9 @@ def render_map(
     map_data:  dict[str, Any] | None,
     metadata:  list[dict[str, Any]] | None,
     live_data: dict[str, Any] | None = None,
+    options: dict | None = None,
+    *,
+    raise_errors: bool = False,
 ) -> bytes:
     """Render the Dyson floor map to PNG bytes.
 
@@ -80,8 +86,10 @@ def render_map(
     if not map_data:
         return _error_image("No map data available")
     try:
-        return _render(map_data, metadata, live_data)
+        return _render(map_data, metadata, live_data, map_options(options))
     except Exception as exc:  # pylint: disable=broad-except
+        if raise_errors:
+            raise
         return _error_image(f"Render error: {exc}")
 
 
@@ -92,6 +100,7 @@ def _render(
     map_data:  dict[str, Any],
     metadata:  list[dict[str, Any]] | None,
     live_data: dict[str, Any] | None,
+    options: dict,
 ) -> bytes:
 
     # ── 1. Collect zones ──────────────────────────────────────────────────────
@@ -177,11 +186,21 @@ def _render(
         return [txy(p) for p in pts]
 
     # ── 3. Create base image ──────────────────────────────────────────────────
-    img = Image.new("RGBA", (W, H), BG)
+    img = Image.new("RGBA", (W, H),
+                    (0, 0, 0, 0) if options["map_transparent_background"] else BG)
+    if options["map_show_grid"]:
+        _draw_grid(img, tx, ty, min_x, max_x, min_y, max_y)
+    if options["map_show_status_areas"]:
+        for zone in zones:
+            points = _perimeter_points(zone)
+            if len(points) >= 3:
+                fill = STATUS_COLORS.get(zone.get("cleanStatus"))
+                if fill:
+                    _poly_alpha(img, txy_list(points), fill, (0, 0, 0, 0))
 
     # ── 4. Keep-out / restriction zones ───────────────────────────────────────
     draw = ImageDraw.Draw(img)
-    for r in _get_restrictions(map_data, live_data):
+    for r in (_get_restrictions(map_data, live_data) if options["map_show_restrictions"] else []):
         bnd = r.get("points") or r.get("boundary") or []
         if len(bnd) >= 3:
             _poly_alpha(img, txy_list(bnd), KEEPOUT_FILL, KEEPOUT_STROKE,
@@ -193,7 +212,7 @@ def _render(
     for z in zones:
         # Perimeter border — one line per segment, skip large jumps
         draw = ImageDraw.Draw(img)
-        for seg_start, seg_end in _perimeter_segments(z):
+        for seg_start, seg_end in (_perimeter_segments(z) if options["map_show_perimeter"] else []):
             sx, sy = _pt(seg_start)
             ex, ey = _pt(seg_end)
             if math.hypot(ex - sx, ey - sy) > 1.5:
@@ -202,7 +221,7 @@ def _render(
 
         # Historical visited path — skip large jumps
         visited = z.get("visited", [])
-        if len(visited) > 1:
+        if options["map_show_visited_paths"] and len(visited) > 1:
             draw = ImageDraw.Draw(img)
             vpts = [_pt(p) for p in visited]
             for j in range(len(vpts) - 1):
@@ -213,7 +232,7 @@ def _render(
                 draw.line([txy(vpts[j]), txy(vpts[j + 1])], fill=ZONE_VISITED, width=1)
 
     # ── 6. Furniture ──────────────────────────────────────────────────────────
-    for f in _get_furniture(map_data, live_data):
+    for f in (_get_furniture(map_data, live_data) if options["map_show_furniture"] else []):
         bnd = f.get("points") or f.get("boundary") or []
         if len(bnd) >= 3:
             _poly_alpha(img, txy_list(bnd), FURN_FILL, FURN_STROKE)
@@ -224,17 +243,30 @@ def _render(
         cp = live_data.get("cleanPath", [])
         if len(cp) > 1:
             pts2 = [txy(p) for p in cp]
-            for j in range(len(pts2) - 1):
-                draw.line([pts2[j], pts2[j + 1]], fill=PATH_GLOW, width=6)
-            for j in range(len(pts2) - 1):
-                draw.line([pts2[j], pts2[j + 1]], fill=PATH_MAIN, width=3)
-            for j in range(4, len(pts2), 5):
-                x, y = pts2[j]
-                draw.ellipse([x - 3, y - 3, x + 3, y + 3], fill=PATH_MAIN)
+            modes = live_data.get("_pathModes", [None] * (len(pts2) - 1))
+            colors = [tuple(options[MAP_PATH_ACTIONS[mode]]) + (255,)
+                      if mode in MAP_PATH_ACTIONS else PATH_UNKNOWN for mode in modes]
+            if len(colors) != len(pts2) - 1:
+                colors = [PATH_UNKNOWN] * (len(pts2) - 1)
+            if options["map_glow_width"] > 0:
+                glow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+                glow_draw = ImageDraw.Draw(glow)
+                for j, color in enumerate(colors):
+                    glow_draw.line([pts2[j], pts2[j + 1]], fill=color[:3] + (50,),
+                                   width=options["map_glow_width"])
+                img.alpha_composite(glow)
+            draw = ImageDraw.Draw(img)
+            for j, color in enumerate(colors):
+                draw.line([pts2[j], pts2[j + 1]], fill=color,
+                          width=options["map_path_width"])
+            if options["map_show_waypoints"]:
+                for j in range(4, len(pts2), 5):
+                    x, y = pts2[j]
+                    draw.ellipse([x - 3, y - 3, x + 3, y + 3], fill=colors[j - 1])
 
     # ── 8. Dock ───────────────────────────────────────────────────────────────
     dock = _get_dock(map_data, live_data)
-    if dock:
+    if dock and options["map_show_dock"]:
         dx, dy = int(tx(dock["x"])), int(ty(dock["y"]))
         draw = ImageDraw.Draw(img)
         draw.ellipse([dx - 9, dy - 9, dx + 9, dy + 9], fill=DOCK)
@@ -269,13 +301,66 @@ def _render(
         draw = ImageDraw.Draw(img)
         name = (z.get("name") or "").upper()
         area = f"{z.get('area', 0):.1f} m²"
-        _draw_centered_text(draw, lx, ly - 12, name, font_l, ZONE_LABEL)
-        _draw_centered_text(draw, lx, ly + 2, area, font_s, area_label_col)
+        if options["map_show_room_names"]:
+            _draw_centered_text(draw, lx, ly - 12, name, font_l, ZONE_LABEL)
+        if options["map_show_room_areas"]:
+            _draw_centered_text(draw, lx, ly + 2, area, font_s, area_label_col)
+    if options["map_show_legend"]:
+        _draw_legend(img, zones, font_s)
 
     # ── 11. Serialise ─────────────────────────────────────────────────────────
     buf = io.BytesIO()
-    img.convert("RGB").save(buf, format="PNG", optimize=False)
+    output = img if options["map_transparent_background"] else img.convert("RGB")
+    output.save(buf, format="PNG", optimize=False)
     return buf.getvalue()
+
+
+# Optional layers do not change the canvas dimensions or coordinate transform.
+STATUS_COLORS = {
+    "CLEAN_COMPLETE": (134, 239, 172, 100),
+    "CLEAN_IN_PROGRESS": (74, 222, 128, 100),
+    "CLEANING": (74, 222, 128, 100),
+    "CLEAN_PENDING": (56, 189, 248, 60),
+    "CLEAN_NOT_REQUESTED": (0, 0, 0, 0),
+}
+
+
+def _draw_grid(img, tx, ty, min_x, max_x, min_y, max_y):
+    """Draw metre grid, distance labels and origin without resizing the map."""
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    _, font = _load_fonts()
+    for x in range(math.ceil(min_x), math.floor(max_x) + 1):
+        px = int(tx(x))
+        draw.line([(px, int(ty(max_y))), (px, int(ty(min_y)))],
+                  fill=(148, 163, 184, 45), width=1)
+        _draw_centered_text(draw, px, img.height - 16, f"{x} m", font, ZONE_LABEL)
+    for y in range(math.ceil(min_y), math.floor(max_y) + 1):
+        py = int(ty(y))
+        draw.line([(int(tx(min_x)), py), (int(tx(max_x)), py)],
+                  fill=(148, 163, 184, 45), width=1)
+        _draw_centered_text(draw, 22, py, f"{y} m", font, ZONE_LABEL)
+    if min_x <= 0 <= max_x and min_y <= 0 <= max_y:
+        ox, oy = int(tx(0)), int(ty(0))
+        draw.ellipse((ox - 4, oy - 4, ox + 4, oy + 4), outline=ZONE_LABEL)
+    img.alpha_composite(overlay)
+
+
+def _draw_legend(img, zones, font):
+    """Place labels inside the existing image; never alter overlay alignment."""
+    draw = ImageDraw.Draw(img)
+    y = 14
+    for zone in zones:
+        if y + 18 > img.height:
+            break
+        color = STATUS_COLORS.get(zone.get("cleanStatus"), ZONE_VISITED)
+        draw.rectangle((12, y, 20, y + 8), fill=color[:3] + (255,))
+        name = str(zone.get("name") or zone.get("id") or "Room")
+        # Long labels stay within the canvas, rather than changing its extent.
+        while len(name) > 1 and draw.textbbox((0, 0), name, font=font)[2] > img.width - 42:
+            name = name[:-2] + "…"
+        draw.text((28, y - 2), name, fill=ZONE_LABEL, font=font)
+        y += 18
 
 
 # ── Data extraction helpers ────────────────────────────────────────────────────
