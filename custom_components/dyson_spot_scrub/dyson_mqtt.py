@@ -32,6 +32,8 @@ from urllib.parse import quote
 
 import paho.mqtt.client as mqtt
 
+from .station_settings import STATE_FIELDS, current_setting, setting_payloads, reported_properties
+
 _LOGGER = logging.getLogger(__name__)
 
 _PREFERENCE_TIMEOUT = 10.0
@@ -433,6 +435,27 @@ class DysonMqttClient:
     def request_current_state(self) -> None:
         self._publish({"msg": "REQUEST-CURRENT-STATE", "time": _now_iso()})
 
+    def set_station_setting(self, key: str, value) -> bool:
+        """Send the captured app command pair; await telemetry before showing it.
+
+        Publish success only means transport acceptance, not device confirmation.
+        No automatic retries: a partial send may already have changed the robot.
+        """
+        state_fields, props = setting_payloads(key, value)
+        if not self.connected or current_setting(self.state, key) is None:
+            return False
+        if current_setting(self.state, key) == value:
+            return True
+        if not self._publish({"msg": "STATE-SET", "mode-reason": "RAPP",
+                              "time": _now_iso(), **state_fields}):
+            return False
+        accepted = self._publish_raw(self._jdm_command_topic, {
+            "msgId": _rand_msg_id(), "version": "1.0.1",
+            "method": "prop.set", "params": props,
+        })
+        self.request_current_state()
+        return accepted
+
     def start_mode(self, mode: int) -> bool:
         """Start all rooms in mode 0-3, preserving their other settings."""
         return self._start_cleaning(mode)
@@ -811,7 +834,7 @@ class DysonMqttClient:
         self.connected = True
         # Retain map/preferences, but never authorize a new job from a previous
         # connection's readiness snapshot. Wait for fresh robot/dock telemetry.
-        for key in ("state", "dockState", "workMode", "jdmStatus"):
+        for key in ("state", "dockState", "workMode", "jdmStatus", *STATE_FIELDS):
             self.state.pop(key, None)
         self._notify_state_change()
         self._preferences_fetched = False  # Allow re-fetch on reconnect
@@ -896,6 +919,15 @@ class DysonMqttClient:
 
         if method == "prop.post" and data.get("params"):
             self._merge_jdm_props(data["params"])
+        elif method == "prop.get" and data.get("code") in (0, 1) and isinstance(data.get("data"), dict):
+            # Dyson returns code 1 for partially supported property requests.
+            updates = reported_properties(data["data"])
+            if updates:
+                self.state = {**self.state, **updates}
+                self._notify_state_change()
+        elif method == "prop.set" and data.get("code") != 0:
+            _LOGGER.warning("[%s] Station property write rejected (code=%s)",
+                            self.serial, data.get("code"))
         elif method == "service.get_preference":
             pref = data.get("data")
             success = data.get("code") == 0 and isinstance(pref, dict)
@@ -940,7 +972,7 @@ class DysonMqttClient:
             )
 
     def _merge_jdm_props(self, props: dict) -> None:
-        updates: dict = {}
+        updates: dict = reported_properties(props)
         work_time = props.get("work_time")
         if isinstance(work_time, dict) and self.state.get("dockState") == "DRYING_MOP":
             total, remaining = work_time.get("total"), work_time.get("surplus")

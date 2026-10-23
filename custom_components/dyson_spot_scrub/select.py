@@ -33,6 +33,8 @@ from .const import (
     DEFAULT_MODE,
 )
 from .coordinator import DysonCoordinator
+from .station_entity import StationEntity
+from .station_settings import SELECTS
 from .dyson_mqtt import _room_display_name
 
 _LOGGER = logging.getLogger(__name__)
@@ -99,6 +101,8 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: DysonCoordinator = hass.data[DOMAIN][entry.entry_id]
+    async_add_entities([DysonStationSelect(coordinator, entry, key, *item)
+                        for key, item in SELECTS.items()])
     known_rooms: set[str] = set()
 
     # Global cleaning-mode select — created immediately, no room data needed
@@ -330,3 +334,23 @@ class DysonRoomSelectEntity(SelectEntity):
     @callback
     def async_write_ha_state(self) -> None:
         super().async_write_ha_state()
+
+
+class DysonStationSelect(StationEntity, SelectEntity):
+    """Select among station settings observed in the MyDyson app."""
+
+    _attr_icon = "mdi:tune"
+
+    def __init__(self, coordinator, entry, key, name, options):
+        super().__init__(coordinator, entry, key, name)
+        self._attr_options = list(options)
+
+    @property
+    def current_option(self):
+        return self.setting_value
+
+    async def async_select_option(self, option):
+        if option not in self._attr_options:
+            from homeassistant.exceptions import HomeAssistantError
+            raise HomeAssistantError("Unsupported station setting")
+        await self._async_set_setting(option)

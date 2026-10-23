@@ -15,6 +15,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, CONF_SERIAL, CONF_DEVICE_NAME, CONF_PRODUCT_TYPE
 from .coordinator import DysonCoordinator
+from .station_entity import StationEntity
+from .station_settings import SWITCHES
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,6 +27,8 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: DysonCoordinator = hass.data[DOMAIN][entry.entry_id]
+    async_add_entities([DysonStationSwitch(coordinator, entry, key, item[0])
+                        for key, item in SWITCHES.items()])
     known_rooms: set[str] = set()
 
     @callback
@@ -113,3 +117,19 @@ class DysonRoomSwitchEntity(SwitchEntity):
     @callback
     def async_write_ha_state(self) -> None:
         super().async_write_ha_state()
+
+
+class DysonStationSwitch(StationEntity, SwitchEntity):
+    """A confirmed station preference, independent of room selection."""
+
+    _attr_icon = "mdi:tune"
+
+    @property
+    def is_on(self):
+        return self.setting_value
+
+    async def async_turn_on(self, **kwargs):
+        await self._async_set_setting(True)
+
+    async def async_turn_off(self, **kwargs):
+        await self._async_set_setting(False)
