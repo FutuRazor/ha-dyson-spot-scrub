@@ -48,6 +48,16 @@ class DysonStartButton(ButtonEntity):
             serial_number=entry.data[CONF_SERIAL],
         )
 
+    async def async_added_to_hass(self) -> None:
+        self._coordinator.async_add_listener(self)
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._coordinator.async_remove_listener(self)
+
+    @callback
+    def async_write_ha_state(self) -> None:
+        super().async_write_ha_state()
+
     @property
     def available(self) -> bool:
         """True only when the MQTT connection is live."""
