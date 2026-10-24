@@ -522,6 +522,68 @@ class DysonMqttClient:
             return False
         return self._abort_dock_action()
 
+    def empty_bin(self) -> bool:
+        """Trigger the dock to collect dust from the robot's bin.
+
+        Mirrors the Dyson app sequence (MQTT capture Oct 2026):
+          legacy: START-DOCK-ACTION / action=COLLECT_DUST
+          JDM:    service.start_station_act / station_act=3, ctrl_value=1
+        Returns False if not connected or a dock action is already running.
+        """
+        dock = self.state.get("dockState")
+        if not self.connected:
+            _LOGGER.warning("[%s] empty_bin: not connected", self.serial)
+            return False
+        if dock in {"COLLECTING_DUST", "WASHING_MOP", "DRYING_MOP"}:
+            _LOGGER.warning(
+                "[%s] empty_bin: dock already busy (%s)", self.serial, dock
+            )
+            return False
+        _LOGGER.info("[%s] → EMPTY_BIN (station_act=3)", self.serial)
+        self._publish({
+            "msg":         "START-DOCK-ACTION",
+            "action":      "COLLECT_DUST",
+            "mode-reason": "RAPP",
+            "time":        _now_iso(),
+        })
+        self._publish_jdm("service.start_station_act", {
+            "station_act": 3,
+            "ctrl_value":  1,
+        })
+        return True
+
+    def wash_mop(self) -> bool:
+        """Trigger the dock to wash then air-dry the mop roller.
+
+        Mirrors the Dyson app sequence (MQTT capture Oct 2026):
+          legacy: START-DOCK-ACTION / action=WASH_MOP
+          JDM:    service.start_station_act / station_act=1, ctrl_value=1
+        The dock auto-transitions to DRYING_MOP after washing (station_act=2)
+        — no separate dry command is needed.
+        Returns False if not connected or a dock action is already running.
+        """
+        dock = self.state.get("dockState")
+        if not self.connected:
+            _LOGGER.warning("[%s] wash_mop: not connected", self.serial)
+            return False
+        if dock in {"COLLECTING_DUST", "WASHING_MOP", "DRYING_MOP"}:
+            _LOGGER.warning(
+                "[%s] wash_mop: dock already busy (%s)", self.serial, dock
+            )
+            return False
+        _LOGGER.info("[%s] → WASH_MOP (station_act=1)", self.serial)
+        self._publish({
+            "msg":         "START-DOCK-ACTION",
+            "action":      "WASH_MOP",
+            "mode-reason": "RAPP",
+            "time":        _now_iso(),
+        })
+        self._publish_jdm("service.start_station_act", {
+            "station_act": 1,
+            "ctrl_value":  1,
+        })
+        return True
+
     def _clear_drying_time(self) -> None:
         """Never carry a previous cycle's times into a new dock cycle."""
         self.state = {key: value for key, value in self.state.items()

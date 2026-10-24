@@ -10,7 +10,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE
+from homeassistant.const import PERCENTAGE, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -33,6 +33,7 @@ async def async_setup_entry(
         *(DysonConsumableSensor(coordinator, entry, kind, key, name)
           for kind, key, name in CONSUMABLES),
         DysonCleaningSolutionSensor(coordinator, entry),
+        DysonDryingCountdownSensor(coordinator, entry),
     ])
 
 
@@ -163,3 +164,50 @@ class DysonCleaningSolutionSensor(DysonBatterySensor):
         if value is False:
             return "ok"
         return None
+
+
+class DysonDryingCountdownSensor(DysonBatterySensor):
+    """Seconds remaining in the dock's mop-roller drying cycle.
+
+    The dock pushes work_time props (drying_remaining_seconds,
+    drying_total_seconds, drying_updated_at) during DRYING_MOP, which
+    _merge_jdm_props() in dyson_mqtt.py already stores on coordinator.state.
+    This sensor is only available while dockState == 'DRYING_MOP'.
+    """
+
+    _attr_name             = "Mop drying time remaining"
+    _attr_device_class     = SensorDeviceClass.DURATION
+    _attr_state_class      = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
+    _attr_icon             = "mdi:fan-clock"
+
+    def __init__(self, coordinator: DysonCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.data[CONF_SERIAL]}_drying_remaining"
+
+    @property
+    def available(self) -> bool:
+        """True only while MQTT is live and the dock is actively drying."""
+        mqtt = self._coordinator.mqtt
+        if not (mqtt and mqtt.connected):
+            return False
+        return self._coordinator.state.get("dockState") == "DRYING_MOP"
+
+    @property
+    def native_value(self) -> int | None:
+        remaining = self._coordinator.state.get("drying_remaining_seconds")
+        if isinstance(remaining, (int, float)) and math.isfinite(remaining) and remaining >= 0:
+            return int(remaining)
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        state = self._coordinator.state
+        attrs: dict = {}
+        total = state.get("drying_total_seconds")
+        if isinstance(total, (int, float)) and math.isfinite(total):
+            attrs["total_seconds"] = int(total)
+        updated_at = state.get("drying_updated_at")
+        if updated_at is not None:
+            attrs["updated_at"] = updated_at
+        return attrs
